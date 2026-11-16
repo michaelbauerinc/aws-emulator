@@ -246,3 +246,10 @@ mod unsubscribe_stops_delivery;
 
 #[path = "all/validation_rules.rs"]
 mod validation_rules;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

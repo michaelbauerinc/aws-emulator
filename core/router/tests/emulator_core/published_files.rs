@@ -40,8 +40,8 @@ fn the_published_credentials_and_config_describe_the_running_emulator() {
     assert!(!region.is_empty(), "{config}");
     let endpoint = format!("https://127.0.0.1:{}", emulator.port);
     assert_eq!(value("endpoint_url"), Some(endpoint), "{config}");
-    let ca_bundle = emulator.file("ca.pem").display().to_string();
-    assert_eq!(value("ca_bundle"), Some(ca_bundle), "{config}");
+    let ca_bundle = value("ca_bundle").map(std::path::PathBuf::from);
+    assert_eq!(ca_bundle, Some(emulator.file("ca.pem")), "{config}");
 }
 
 #[test]

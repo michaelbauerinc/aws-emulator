@@ -46,30 +46,36 @@
 //!
 //! # Bounds
 //!
+//! Memory accounting uses per-thread page faults on Linux, FreeBSD, and OpenBSD. Windows
+//! uses an explicitly installed allocator observer: each environment owns its backing
+//! allocations, and each phase records its peak live growth from the host's baseline.
+//! Allocation churn therefore spends peak live memory, rather than cumulative traffic.
+//! This is cooperative accounting, not a hard allocation quota. Other hosts, a missing
+//! Windows observer, and failed accounting refuse or stop the run instead of using zero.
+//!
 //! Every bound lives in host code the guest cannot switch off:
 //!
-//! * STEPS and the DEADLINE are checked by [`Bounds::step`], which the interpreter's trace
-//!   hook calls DIRECTLY: the hook is a host function ([`install_trace_hook`]) rather than
-//!   Python, so no module attribute, global or default argument stands between a traced event
-//!   and the bound, and the host then REMOVES `sys.settrace` / `sys.setprofile` /
-//!   `sys.gettrace`, so no guest call can clear or replace it either. The stop is LATCHED:
-//!   once the budget is spent the run's answer is that stop, whatever the guest goes on to
-//!   return or catch.
+//! * STEPS and the DEADLINE are checked at bytecode instructions by a native monitoring
+//!   callback ([`install_bound_monitor`]). Monitoring remains active when a callback
+//!   raises; a second callback rejects exception-handler entry after a stop is latched.
+//!   Guest trace/profile/audit registration and monitoring controls are removed before
+//!   package code runs. A guest cannot replace the callbacks or catch a spent budget.
 //!   Every deadline of a run — the one the hook spends and the one the host's own watch
 //!   samples — is read against the CLOCK the host hands the run ([`run_against`]), which is
 //!   this host's own for every invocation this emulator serves. A run can therefore be
 //!   judged against a clock whose span the host's own speed cannot spend, which is what lets
 //!   a run asked about one of the bounds below be answered by THAT bound rather than by its
 //!   deadline on a host slow enough to spend it.
-//! * MEMORY is sampled from outside the guest — this thread's faulted pages and the
-//!   process's resident size — because the interpreter exposes no allocation seam; a sample
-//!   past the run's own ceiling ends the run, and so does one showing the run has grown the
-//!   whole process past the process ceiling. Both are measured from what was held once the
-//!   interpreter was standing and before a line of the run's own code had been read
+//! * MEMORY is measured outside the guest: thread faults and process residency on Unix,
+//!   owned backing allocations on Windows. A sample past the run's ceiling ends it. The
+//!   process reading is attributed to the run using its own growth, so another service's
+//!   Windows allocations cannot alone exhaust this invocation. Baselines are taken once the
+//!   interpreter is standing and before a line of the run's own code has been read
 //!   ([`Bounds::measure_memory_from_here`]), and the HOST takes that baseline: nothing the
 //!   guest can call re-takes it, so the ceiling cannot be lifted by asking.
-//! * A long NATIVE call emits no trace event, so neither the deadline nor a memory sample can
-//!   land inside one. That is what the host's own watch ([`watch_run`]) is for: ONE thread of
+//! * A long NATIVE call emits no instruction checkpoint, so neither the deadline nor a
+//!   memory sample can land inside one. That is what the host's own watch ([`watch_run`]) is
+//!   for: ONE thread of
 //!   this process reads the same clock and the same process reading for every live run and
 //!   LATCHES the stop, which the next event the interpreter delivers then raises — so one
 //!   native allocation that takes the process past its ceiling ends that run without waiting
@@ -86,6 +92,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
+
+mod memory;
+
+use memory::UNAVAILABLE as MEMORY_ACCOUNTING_UNAVAILABLE;
 
 use rustpython_vm::function::FuncArgs;
 use rustpython_vm::builtins::PyModule;
@@ -191,14 +201,11 @@ const ALLOWED_NATIVE_MODULES: &[&str] = &[
 /// functions the runtime source calls.
 const SUPPLIED_MODULES: &[&str] = &[HOST_MODULE, "posix"];
 
-/// How many trace events pass between two readings of the whole PROCESS's resident size.
+/// How many instructions pass between two readings of the whole PROCESS's resident size.
 /// That reading is a request to the operating system, so it is taken often enough to catch
 /// a process-wide growth inside one bounded stretch of work and seldom enough not to
 /// dominate the run; the RUN's own memory is sampled at every event ([`Bounds::step`]).
 const STEPS_BETWEEN_PROCESS_SAMPLES: u64 = 2_048;
-
-/// The size of a page of this process's memory, which the faulted-page count is scaled by.
-const PAGE_BYTES: u64 = 4_096;
 
 /// The resident size this WHOLE process may reach while a handler is running, whatever any
 /// one run has added.
@@ -288,11 +295,9 @@ pub fn run_against(request: &Run<'_>, clock: &Clock) -> Finished {
 pub(super) struct Prepared {
     /// The interpreter itself, finalized by [`Self::finalize`] and not before.
     interpreter: Interpreter,
-    /// The invocation this environment is serving, which the host functions and the trace
-    /// hook read.
+    /// The invocation this environment is serving, which the host functions and bound
+    /// monitor read.
     session: Arc<Session>,
-    /// Where the installed trace hook is held, for the life of the environment.
-    held: TraceCell,
     /// The runtime's INVOKE entry point ([`super::bootstrap`]).
     invoke: PyObjectRef,
     /// The runtime's BIND entry point, which puts the next invocation's own request on the
@@ -307,9 +312,9 @@ pub(super) struct Prepared {
     /// later invocation brings its own, because nothing of the environment it is served in is
     /// its doing.
     initializing: ::std::cell::RefCell<Option<Spending>>,
-    /// What this thread had faulted in when the environment was BUILT, which is what the
-    /// environment's own growth is measured against ([`Self::grown_bytes`]).
-    faulted_at_build: u64,
+    /// The environment's memory identity and standing growth baseline, retained across
+    /// invocations and through finalization.
+    memory: memory::Tracker,
 }
 
 /// What one invocation writes its log into and what it spends, which [`Session`] binds onto
@@ -324,8 +329,19 @@ impl Prepared {
     /// the runtime wrote for it, or the internal failure of an interpreter that could not be
     /// stood up. No environment is kept in either case.
     pub(super) fn start(request: &Run<'_>, clock: &Clock) -> Result<Self, Box<Finished>> {
+        let Ok(mut memory) = memory::Tracker::new() else {
+            return Err(Box::new(Finished {
+                completion: Completion::Internal(MEMORY_ACCOUNTING_UNAVAILABLE.to_string()),
+                log: String::new(),
+                elapsed: Duration::ZERO,
+            }));
+        };
         let capture = Arc::new(Mutex::new(Capture::new(request.budget.log_bytes)));
-        let bounds = Arc::new(Bounds::new(&request.budget, clock.clone()));
+        let bounds = Arc::new(Bounds::new(
+            &request.budget,
+            clock.clone(),
+            memory.initial_run(),
+        ));
         let session = Session::new(&capture, &bounds, request.aws);
         let input = match runtime_input(request) {
             Ok(input) => input,
@@ -339,6 +355,29 @@ impl Prepared {
             }
         };
         let contained = Arc::new(AtomicBool::new(false));
+        if memory::prewarm_shared(|| {
+            let context = ::rustpython_vm::Context::genesis();
+            let _ = ::rustpython_vm::stdlib::builtin_module_defs(context);
+            let _ = ::rustpython_stdlib::stdlib_module_defs(context);
+            let _ = super::host_posix::module::module_def(context);
+            #[cfg(windows)]
+            let _ = super::host_csv::module_def(context);
+        })
+        .is_err()
+        {
+            return Err(Box::new(Finished {
+                completion: Completion::Internal(MEMORY_ACCOUNTING_UNAVAILABLE.to_string()),
+                log: String::new(),
+                elapsed: Duration::ZERO,
+            }));
+        }
+        let Ok(_memory_scope) = memory.enter() else {
+            return Err(Box::new(Finished {
+                completion: Completion::Internal(MEMORY_ACCOUNTING_UNAVAILABLE.to_string()),
+                log: String::new(),
+                elapsed: Duration::ZERO,
+            }));
+        };
         let interpreter = interpreter(&contained);
         // A run only happens when the native surface really was narrowed to the allow-list. If
         // it could not be, nothing is run at all: an uncontained interpreter is never handed
@@ -354,15 +393,11 @@ impl Prepared {
                 Duration::ZERO,
             )));
         }
-        // The hook the bounds are spent through, held HERE: it stays installed and answering
-        // until the interpreter has been finalized, because finalization runs the guest's own
-        // `atexit` callbacks and those frames are traced like every other guest frame.
-        let held: TraceCell = ::std::rc::Rc::new(::std::cell::RefCell::new(None));
         // The host's own watch over the initialization, sampling the clock from OUTSIDE the
         // guest for as long as it lasts ([`watch_run`]).
         watch_run(&bounds);
         let initialized = interpreter.enter(|vm| {
-            match initialize(vm, request, &input, &session, &bounds, &held) {
+            match initialize(vm, request, &input, &session, &bounds) {
                 Ok(initialized) => initialized,
                 Err(exception) => {
                     Initialized::Answered(Completion::Internal(formatted_exception(vm, &exception)))
@@ -370,23 +405,33 @@ impl Prepared {
             }
         });
         match initialized {
-            Initialized::Ready(entries) => Ok(Self {
-                interpreter,
-                session,
-                held,
-                invoke: entries.invoke,
-                bind: entries.bind,
-                initializing: ::std::cell::RefCell::new(Some((capture, bounds))),
-                // Taken on the environment's OWN thread, which is the one every invocation
-                // served in it runs on: what it has faulted in beyond this is what the
-                // environment holds of the host.
-                faulted_at_build: faulted_bytes(),
-            }),
+            Initialized::Ready(entries) => {
+                // A standing environment also needs a valid growth baseline. If that
+                // reading fails, finalize it under the latched stop instead of pooling it.
+                if memory.mark_built().is_err() {
+                    bounds.breach(Stop::Memory);
+                    drop(entries);
+                    interpreter.finalize(None);
+                    return Err(Box::new(settled(
+                        Completion::Stopped(Stop::Memory),
+                        &bounds,
+                        &capture,
+                        Duration::ZERO,
+                    )));
+                }
+                Ok(Self {
+                    interpreter,
+                    session,
+                    invoke: entries.invoke,
+                    bind: entries.bind,
+                    initializing: ::std::cell::RefCell::new(Some((capture, bounds))),
+                    memory,
+                })
+            }
             Initialized::Answered(completion) => {
                 // Nothing of a failed initialization is kept: the interpreter is finalized
                 // here, exactly as it is after a run.
                 interpreter.finalize(None);
-                held.borrow_mut().take();
                 Err(Box::new(settled(
                     completion,
                     &bounds,
@@ -432,19 +477,31 @@ impl Prepared {
 
     /// How much memory this environment has added to its thread since it was BUILT.
     ///
-    /// The same reading the per-run ceiling is measured with ([`Bounds::step`]), taken on the
-    /// environment's own thread: the pages this thread has faulted in, which is what the
+    /// On Unix this is the same reading the per-run ceiling uses ([`Bounds::step`]), taken
+    /// on the environment's own thread: the pages this thread has faulted in, which is what the
     /// interpreter standing in it has taken of the host. The count never falls, so what it
     /// reports is an UPPER bound on what the environment is holding now — a page freed and
     /// touched again is counted twice — which is the side to err on for a bound: an
     /// environment is retired on this reading, so the reading may retire one that had given
     /// memory back and never keeps one that has not.
     ///
+    /// Windows instead reads this owner's CURRENT live backing bytes, including allocation
+    /// metadata and padding, against its post-initialization baseline. Freed scratch space
+    /// does not accumulate as standing growth; retained globals do. The per-run phase peak
+    /// still notices a temporary burst even after it has been freed.
+    ///
     /// It is what bounds a STANDING environment ([`super::warm_pool`]), where a per-invocation
     /// delta says nothing: the share of the run envelope an invocation held goes back when the
     /// invocation is answered, and this is what the environment still holds afterwards.
     pub(super) fn grown_bytes(&self) -> u64 {
-        faulted_bytes().saturating_sub(self.faulted_at_build)
+        match self.memory.grown_bytes() {
+            Ok(growth) => growth,
+            Err(_) => {
+                // The pool must retire an environment whose growth it cannot measure.
+                self.session.bounds().breach(Stop::Memory);
+                u64::MAX
+            }
+        }
     }
 
     /// Bind one invocation onto this environment and run it.
@@ -457,7 +514,11 @@ impl Prepared {
             Some((capture, bounds)) => (capture, bounds, false),
             None => {
                 let capture = Arc::new(Mutex::new(Capture::new(request.budget.log_bytes)));
-                let bounds = Arc::new(Bounds::new(&request.budget, clock.clone()));
+                let bounds = Arc::new(Bounds::new(
+                    &request.budget,
+                    clock.clone(),
+                    self.memory.existing_run(),
+                ));
                 self.session.bind(&capture, &bounds, request.aws);
                 watch_run(&bounds);
                 (capture, bounds, true)
@@ -473,6 +534,15 @@ impl Prepared {
                     elapsed: started.elapsed(),
                 }
             }
+        };
+        let Ok(_memory_scope) = self.memory.enter() else {
+            bounds.breach(Stop::Memory);
+            return Ran {
+                completion: Completion::Stopped(Stop::Memory),
+                bounds,
+                capture,
+                elapsed: started.elapsed(),
+            };
         };
         let completion = self.interpreter.enter(|vm| {
             match served(vm, self, &input, request.environment, &bounds, reused) {
@@ -495,15 +565,22 @@ impl Prepared {
     /// — the module table, the code objects, the exception types — uncollected, so the
     /// environment would hold its interpreter's memory for the life of this process. Finalizing
     /// it is also what the language itself does at the end of a program, so a handler's
-    /// `atexit` callback runs the way it runs on the real runtime — and it runs BOUNDED: the
-    /// hook is still installed and still answering itself as each frame's local tracer, and
-    /// the bounds bound here are a span of their own rather than the spent ones of the
+    /// `atexit` callback runs the way it runs on the real runtime — and it runs BOUNDED:
+    /// the monitor remains installed through finalization, and the bounds bound here are a
+    /// span of their own rather than the spent ones of the
     /// invocation this environment last served, so the callbacks of an environment that is
     /// retired long after its last invocation are neither unbounded nor stopped before their
     /// first event.
     pub(super) fn finalize(self, budget: Budget, clock: &Clock) {
         let capture = Arc::new(Mutex::new(Capture::new(budget.log_bytes)));
-        let bounds = Arc::new(Bounds::new(&budget, clock.clone()));
+        let bounds = Arc::new(Bounds::new(
+            &budget,
+            clock.clone(),
+            self.memory.existing_run(),
+        ));
+        if memory::MEASURE_FINALIZATION {
+            bounds.measure_memory_from_here();
+        }
         // No SDK seam: a callback running as the environment is torn down belongs to no
         // invocation, so there is no caller whose identity a call could be made as.
         self.session.bind(&capture, &bounds, None);
@@ -513,21 +590,21 @@ impl Prepared {
 
     /// Finalize the interpreter, against whatever is bound on the session.
     fn torn_down(self) {
+        let _memory_scope = self.memory.enter();
+        if _memory_scope.is_err() {
+            self.session.bounds().breach(Stop::Memory);
+        }
         let Self {
             interpreter,
             session: _,
-            held,
             invoke,
             bind,
             initializing: _,
-            faulted_at_build: _,
+            memory: _,
         } = self;
         drop(invoke);
         drop(bind);
         interpreter.finalize(None);
-        // Only now: the hook and this cell hold each other, so emptying it is what lets the
-        // one the environment installed go.
-        held.borrow_mut().take();
     }
 }
 
@@ -544,7 +621,7 @@ struct Ran {
 }
 
 /// What an invocation brings to the environment serving it, which the host functions and the
-/// trace hook of that environment read.
+/// bound monitor of that environment read.
 ///
 /// An environment's host surface is installed ONCE, with its interpreter, and then serves
 /// invocation after invocation: every one of those functions reads the invocation being
@@ -694,7 +771,6 @@ fn initialize(
     input: &str,
     session: &Arc<Session>,
     bounds: &Arc<Bounds>,
-    held: &TraceCell,
 ) -> PyResult<Initialized> {
     prepare(vm, request.environment, request.budget.recursion_limit, session)?;
     let scope = vm.new_scope_with_builtins();
@@ -713,11 +789,14 @@ fn initialize(
         bind: scope.globals.get_item("__lambda_bind", vm)?,
     };
     let prepared = scope.globals.get_item("__lambda_prepare", vm)?;
-    install_trace_hook(vm, session, held)?;
+    install_bound_monitor(vm, session)?;
     // The interpreter is standing and nothing of the RUN's own code has been read yet, so
     // this is where the memory the run itself takes is measured from. The host takes this
     // baseline, never the guest.
     bounds.measure_memory_from_here();
+    if let Some(stop) = bounds.stopped() {
+        return Ok(Initialized::Answered(Completion::Stopped(stop)));
+    }
     // The INIT phase, under the span an initialization is allowed rather than the
     // function's `Timeout`. It answers nothing when the environment is ready, and the
     // document of a failure that belongs to no invocation when it is not.
@@ -762,6 +841,9 @@ fn served(
     bounds: &Arc<Bounds>,
     reused: bool,
 ) -> PyResult<Completion> {
+    if let Some(stop) = bounds.stopped() {
+        return Ok(Completion::Stopped(stop));
+    }
     install_environment(vm, environment, reused)?;
     let bound = prepared.bind.call((vm.ctx.new_str(input.to_owned()),), vm)?;
     let bound: String = bound.try_into_value(vm)?;
@@ -770,6 +852,9 @@ fn served(
     }
     if reused {
         bounds.measure_memory_from_here();
+        if let Some(stop) = bounds.stopped() {
+            return Ok(Completion::Stopped(stop));
+        }
     }
     // The INVOKE phase begins HERE, which is the handler's own run: from this instant the
     // deadline is the function's `Timeout`, and the instant it falls at is what the handler
@@ -782,9 +867,9 @@ fn served(
 
 /// How often the host's own watch samples a run's deadline.
 ///
-/// A long NATIVE call emits no traced event, so a deadline checked only from the trace hook is
-/// one the guest decides the timing of. The watch reads the same clock from a thread of its
-/// own, so a run that stops producing events is still noticed and still stopped.
+/// A long NATIVE call emits no instruction checkpoint, so checking only at instructions
+/// leaves a gap. The watch reads the same clock from a thread of its own, so a run that
+/// stops producing events is still noticed and still stopped.
 const WATCH_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Have the host's own watch sample this run's deadline while the run lasts.
@@ -794,9 +879,17 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(50);
 /// ended simply falls out of the list. The thread is started with the list, on the first run
 /// of this process.
 fn watch_run(bounds: &Arc<Bounds>) {
-    let mut watched = watched_runs()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    register_watched_run(bounds, watched_runs());
+}
+
+/// Registration and thread startup belong to the host, including any growth of
+/// the registry shared by otherwise unrelated interpreter owners.
+fn register_watched_run(bounds: &Arc<Bounds>, registry: &Mutex<Vec<::std::sync::Weak<Bounds>>>) {
+    let Ok(_untracked) = memory::suppress_host() else {
+        bounds.breach(Stop::Memory);
+        return;
+    };
+    let mut watched = registry.lock().unwrap_or_else(PoisonError::into_inner);
     watched.retain(|run| run.strong_count() > 0);
     watched.push(Arc::downgrade(bounds));
     drop(watched);
@@ -859,13 +952,18 @@ fn interpreter(contained: &Arc<AtomicBool>) -> Interpreter {
         let allowed: Vec<&'static ::rustpython_vm::builtins::PyModuleDef> =
             ::rustpython_stdlib::stdlib_module_defs(&vm.ctx)
                 .into_iter()
-                .filter(|def| ALLOWED_NATIVE_MODULES.contains(&def.name.as_str()))
+                .filter(|def| {
+                    ALLOWED_NATIVE_MODULES.contains(&def.name.as_str())
+                        && (!cfg!(windows) || def.name.as_str() != "_csv")
+                })
                 .collect();
         // The `posix` module a run is built on is THIS crate's (see [`super::host_posix`]):
         // the import system requires a module of that name to exist, and the engine's own
         // — whose calls are the host's — needs an engine feature this crate does not build
         // at all, so there is none in the binary to register.
         let posix = super::host_posix::module::module_def(&vm.ctx);
+        #[cfg(windows)]
+        let csv = super::host_csv::module_def(&vm.ctx);
         let Some(state) = ::std::rc::Rc::get_mut(&mut vm.state) else {
             return;
         };
@@ -879,6 +977,8 @@ fn interpreter(contained: &Arc<AtomicBool>) -> Interpreter {
             state.module_defs.insert(def.name.as_str(), def);
         }
         state.module_defs.insert("posix", posix);
+        #[cfg(windows)]
+        state.module_defs.insert("_csv", csv);
         state.frozen.extend(::rustpython_pylib::FROZEN_STDLIB);
         contained.store(true, Ordering::SeqCst);
     })
@@ -894,6 +994,13 @@ fn prepare(
     recursion_limit: usize,
     session: &Arc<Session>,
 ) -> PyResult<()> {
+    // Frozen importlib selects nt/winreg when sys.platform is win32; this interpreter
+    // exposes only constrained posix. Select its POSIX import path before bootstrap.
+    // The guest consequently reports linux; non-Windows builds keep RustPython's value.
+    #[cfg(windows)]
+    vm.sys_module
+        .as_object()
+        .set_attr("platform", vm.ctx.new_str("linux"), vm)?;
     let modules = vm.sys_module.as_object().get_attr("modules", vm)?;
     // Every allow-listed native module is created ONCE, here, so each is the single
     // patched object `sys.modules` holds from now on. Nothing is imported from a host
@@ -1243,57 +1350,107 @@ fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
         .collect()
 }
 
-/// Install the trace hook the step and deadline bounds are checked from, then take away
-/// every way the guest could clear or replace it.
+/// Install host-owned checkpoints that remain active after a stop is raised.
 ///
-/// The hook is a HOST function, not Python: what the interpreter calls on every traced event
-/// is [`Bounds::step`] itself, reached through no name the guest can rebind — there is no
-/// module attribute, no global and no default argument between the event and the bound. The
-/// bounds it spends are the ones of the invocation the environment is SERVING ([`Session`]),
-/// so an event of the invocation being served now is never charged to the one before it. A
-/// trace function has to answer the local tracer to use, and the local tracer is this same
-/// function, so the one it answers is read from `held` — the cell [`Prepared`] owns, which
-/// stays filled until the interpreter has been FINALIZED, because a guest `atexit` callback
-/// runs during finalization and its line events have to be traced too.
-fn install_trace_hook(
-    vm: &VirtualMachine,
-    session: &Arc<Session>,
-    held: &TraceCell,
-) -> PyResult<()> {
-    let answered = ::std::rc::Rc::clone(held);
+/// Instruction monitoring is independent of writable frame tracing and source-line
+/// tables. The exception-handler callback refuses entry once the bound is latched,
+/// so neither `except BaseException` nor `finally` can resume a stopped run. Both
+/// callbacks read the session's current bounds, including during finalization.
+fn install_bound_monitor(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<()> {
+    const TOOL_ID: i32 = 0;
+    // RustPython's event masks are fixed API values. Its cached `events` namespace
+    // is mutable and shared between interpreters, so it cannot choose these bounds.
+    const INSTRUCTION: i32 = 1 << 6;
+    const EXCEPTION_HANDLED: i32 = 1 << 12;
+    let monitoring = vm.sys_module.as_object().get_attr("monitoring", vm)?;
+    monitoring
+        .get_attr("use_tool_id", vm)?
+        .call((TOOL_ID, "lambda-bounds"), vm)?;
+
     let stepping = Arc::clone(session);
-    let hook = vm.new_function(
-        "__lambda_trace",
+    let step = vm.new_function(
+        "__lambda_step",
         move |_args: FuncArgs, vm: &VirtualMachine| {
             if let Some(stop) = stepping.bounds().step() {
-                return Err(vm.new_runtime_error(stop.reason().to_owned()));
+                return Err(stop_exception(vm, stop));
             }
-            // The local tracer for the frame this event belongs to is this same hook, so
-            // every event of every frame spends the budget.
-            let held = answered.borrow();
-            Ok(held.clone().unwrap_or_else(|| vm.ctx.none()))
+            Ok(vm.ctx.none())
         },
     );
-    let hook: PyObjectRef = hook.into();
-    *held.borrow_mut() = Some(hook.clone());
-    let setter = vm.sys_module.as_object().get_attr("settrace", vm)?;
-    setter.call((hook,), vm)?;
-    // With these gone, no guest call can reach the interpreter's trace slot at all: the
-    // hook that spends the budget is the only one there will be for this run.
-    for name in ["settrace", "setprofile", "gettrace", "getprofile"] {
-        let _ = vm.sys_module.as_object().del_attr(name, vm);
+    monitoring
+        .get_attr("register_callback", vm)?
+        .call((TOOL_ID, INSTRUCTION, step), vm)?;
+    let guarding = Arc::clone(session);
+    let guard = vm.new_function(
+        "__lambda_stop",
+        move |_args: FuncArgs, vm: &VirtualMachine| {
+            if let Some(stop) = guarding.bounds().stopped() {
+                return Err(stop_exception(vm, stop));
+            }
+            Ok(vm.ctx.none())
+        },
+    );
+    monitoring
+        .get_attr("register_callback", vm)?
+        .call((TOOL_ID, EXCEPTION_HANDLED, guard), vm)?;
+    monitoring
+        .get_attr("set_events", vm)?
+        .call((TOOL_ID, INSTRUCTION | EXCEPTION_HANDLED), vm)?;
+
+    // Drop every control callable, rather than retaining one the guest could find
+    // through gc.get_objects(). The interpreter owns only the bound callbacks.
+    let attributes: ::rustpython_vm::builtins::PyDictRef =
+        monitoring.get_attr("__dict__", vm)?.try_into_value(vm)?;
+    attributes.clear();
+    let modules: ::rustpython_vm::builtins::PyDictRef = vm
+        .sys_module
+        .as_object()
+        .get_attr("modules", vm)?
+        .try_into_value(vm)?;
+    if modules.get_item_opt("sys.monitoring", vm)?.is_some() {
+        modules.del_item("sys.monitoring", vm)?;
+    }
+    vm.sys_module.as_object().del_attr("monitoring", vm)?;
+    // Trace/profile and audit callbacks suppress monitoring while they execute.
+    // None may be installed by the guest, including through the all-thread APIs.
+    for name in [
+        "settrace",
+        "setprofile",
+        "gettrace",
+        "getprofile",
+        "_settraceallthreads",
+        "_setprofileallthreads",
+        "addaudithook",
+    ] {
+        vm.sys_module.as_object().del_attr(name, vm)?;
     }
     Ok(())
 }
 
-/// Where the installed trace hook is held, for the life of one execution environment.
-///
-/// The hook answers ITSELF as each frame's local tracer, so this cell holds the hook and the
-/// hook holds this cell. [`Prepared`] owns it and empties it once the interpreter has been
-/// finalized — not before, because a guest `atexit` callback runs during finalization and has
-/// to be traced like every other guest frame — which is what keeps one environment's hook from
-/// outliving the environment that installed it.
-type TraceCell = ::std::rc::Rc<::std::cell::RefCell<Option<PyObjectRef>>>;
+/// Monitoring callbacks run with monitoring suppressed. Allocating their exception
+/// must not start automatic collection, which could run a guest finalizer in that gap.
+fn stop_exception(
+    vm: &VirtualMachine,
+    stop: Stop,
+) -> ::rustpython_vm::builtins::PyBaseExceptionRef {
+    struct RestoreCollection<'a> {
+        vm: &'a VirtualMachine,
+        enabled: bool,
+    }
+    impl Drop for RestoreCollection<'_> {
+        fn drop(&mut self) {
+            if self.enabled {
+                self.vm.state.gc.enable();
+            }
+        }
+    }
+    let _restore = RestoreCollection {
+        vm,
+        enabled: vm.state.gc.is_enabled(),
+    };
+    vm.state.gc.disable();
+    vm.new_runtime_error(stop.reason().to_owned())
+}
 
 /// Clamp how deep the guest may recurse, and take away the call that would raise it.
 fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
@@ -1340,7 +1497,7 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyRef<PyModule> {
     // so there is no name for it on this module at all: [`served`] binds the invocation and
     // begins the invoke phase before calling the runtime ([`Bounds::start`]).
     // The hook that spends the step, deadline and memory budget is NOT here either: the
-    // interpreter calls it directly ([`install_trace_hook`]), so there is no name on this
+    // interpreter calls it directly ([`install_bound_monitor`]), so there is no name on this
     // module for a guest to rebind and no way for guest code to reach the bounds at all.
     // The ONE call a handler reaches another service of this emulator by. The service
     // table, the signature and the destination are all [`super::aws_api`]'s, so what the
@@ -1382,7 +1539,10 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyRef<PyModule> {
             if remaining.is_zero() {
                 return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));
             }
-            let answered = access.call(&service, &operation, &region, &body, remaining);
+            let answered = {
+                let _untracked = suppress_for_service(&calling, vm)?;
+                access.call(&service, &operation, &region, &body, remaining)
+            };
             Ok(vm.ctx.new_str(call_answer(&answered)).into())
         },
     );
@@ -1417,7 +1577,11 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyRef<PyModule> {
                     ))
                     .into());
             };
-            let answer = match access.db_auth_token(&host, port, &user, &region) {
+            let token = {
+                let _untracked = suppress_for_service(&minting, vm)?;
+                access.db_auth_token(&host, port, &user, &region)
+            };
+            let answer = match token {
                 Ok(token) => ::serde_json::json!({ "token": token }).to_string(),
                 Err(Refusal::NotMade(detail)) => refusal_answer("not_made", &detail),
                 Err(_other) => refusal_answer(
@@ -1464,7 +1628,10 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyRef<PyModule> {
             if remaining.is_zero() {
                 return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));
             }
-            let answered = access.send(&method, &url, &headers, &body, remaining);
+            let answered = {
+                let _untracked = suppress_for_service(&sending, vm)?;
+                access.send(&method, &url, &headers, &body, remaining)
+            };
             Ok(vm.ctx.new_str(request_answer(&answered)).into())
         },
     );
@@ -1494,13 +1661,16 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyRef<PyModule> {
                     ))
                     .into());
             };
-            let signed = access.presigned(
-                &service,
-                &operation,
-                &region,
-                &body,
-                Duration::from_secs(expires),
-            );
+            let signed = {
+                let _untracked = suppress_for_service(&presigning, vm)?;
+                access.presigned(
+                    &service,
+                    &operation,
+                    &region,
+                    &body,
+                    Duration::from_secs(expires),
+                )
+            };
             let answered = match signed {
                 Ok(url) => ::serde_json::json!({ "url": url }).to_string(),
                 Err(refused) => refusal_answer_for(&refused),
@@ -1514,19 +1684,38 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyRef<PyModule> {
     // own model ([`super::sdk_model`]). Nothing is dispatched and no service answers, so this
     // spends neither the call count nor the deadline; what the guest decides is only which
     // operation of which service it asks about.
+    #[cfg(windows)]
+    let paginating = Arc::clone(session);
     set_function(
         vm,
         &module,
         "pagination",
         move |args: FuncArgs, vm: &VirtualMachine| {
             let (service, operation): (String, String) = args.bind(vm)?;
-            Ok(vm
-                .ctx
-                .new_str(super::aws_sdk_guest::pagination_config(&service, &operation))
-                .into())
+            let answer = {
+                // First lookup can parse and cache an entire service model. Those
+                // shared host structures are not allocations of the Python handler.
+                #[cfg(windows)]
+                let _untracked = suppress_for_service(&paginating, vm)?;
+                super::aws_sdk_guest::pagination_config(&service, &operation)
+            };
+            // The guest-visible copy is owned even when the host constructed its
+            // original answer while dispatch/model accounting was suppressed.
+            #[cfg(windows)]
+            let answer = answer.clone();
+            Ok(vm.ctx.new_str(answer).into())
         },
     );
     module
+}
+
+/// Suppress ownership only while the host dispatches another service. A failed scope
+/// change must stop before dispatch, not charge the service to the caller accidentally.
+fn suppress_for_service(session: &Arc<Session>, vm: &VirtualMachine) -> PyResult<memory::Scope> {
+    memory::suppress_host().map_err(|_| {
+        session.bounds().breach(Stop::Memory);
+        vm.new_runtime_error(Stop::Memory.reason().to_owned())
+    })
 }
 
 /// What the guest reads back from one AWS SDK call: the service's own answer, or the
@@ -1724,7 +1913,7 @@ pub struct Bounds {
     /// When the HANDLER's run must be over, in milliseconds since the epoch, which is what
     /// the handler is told it has left. Set by [`Self::start`].
     deadline_epoch_ms: ::std::sync::atomic::AtomicI64,
-    /// How many traced events are left.
+    /// How many bytecode instructions are left.
     steps: AtomicU64,
     /// How many have been spent, for the memory-sample interval.
     spent: AtomicU64,
@@ -1732,14 +1921,9 @@ pub struct Bounds {
     memory_bytes: u64,
     /// How large the handler's response may be.
     response_bytes: usize,
-    /// This thread's faulted bytes when the run's own code was about to run, which is what
-    /// the run's own ceiling measures its growth against. Taken by
-    /// [`Self::measure_memory_from_here`], which only the HOST calls — no guest call re-takes
-    /// it, so no guest can raise the baseline it is judged against.
-    faulted_at_start: AtomicU64,
-    /// What this PROCESS held resident at that same instant, which is what the process
-    /// ceiling measures this run's own growth against. Taken there too, for the same reason.
-    resident_at_start: AtomicU64,
+    /// The backend's baselines and stable run measurement. Only the HOST can rebase
+    /// them, so the guest cannot raise the ceiling it is judged against.
+    memory: memory::RunState,
     /// Whether those baselines have been taken yet ([`Self::measure_memory_from_here`]),
     /// which is the instant from which a memory reading says something about THIS RUN — and
     /// so the instant from which the host's own watch judges one ([`Self::watch`]). It is
@@ -1767,8 +1951,8 @@ impl Bounds {
     /// The MEMORY baselines are taken by [`Self::measure_memory_from_here`], once the
     /// interpreter this emulator builds is standing and before any of the run's own code is
     /// read — by the host, because a baseline a guest could re-take is no ceiling at all.
-    fn new(budget: &Budget, clock: Clock) -> Self {
-        Self {
+    fn new(budget: &Budget, clock: Clock, memory: memory::RunState) -> Self {
+        let bounds = Self {
             deadline: Mutex::new(
                 clock.now() + super::INIT_PHASE_LIMIT.saturating_add(budget.wall_clock),
             ),
@@ -1779,29 +1963,32 @@ impl Bounds {
             spent: AtomicU64::new(0),
             memory_bytes: budget.memory_bytes,
             response_bytes: budget.response_bytes,
-            faulted_at_start: AtomicU64::new(faulted_bytes()),
-            resident_at_start: AtomicU64::new(resident_bytes()),
+            memory: memory.capture_process_baseline(),
             measured: AtomicBool::new(false),
             stopped: Mutex::new(None),
             breached: AtomicBool::new(false),
             spending: AtomicBool::new(false),
+        };
+        if bounds.memory.unavailable_at_start() {
+            bounds.breach(Stop::Memory);
         }
+        bounds
     }
 
     /// Measure this run's memory from HERE: the thread's faulted pages and the process's
     /// resident size as they are now, which is what both ceilings judge the run's own growth
     /// against.
     ///
-    /// Called by the HOST only ([`drive`]), once the interpreter is standing and before a
-    /// line of the run's own code has been read, so what it measures is the memory the run
-    /// itself takes and not the environment this emulator built for it. It is deliberately
+    /// Called by the HOST only, before package initialization in [`initialize`] and
+    /// before later invocations in [`served`], so it measures the memory this run adds rather
+    /// than the environment already standing for it. It is deliberately
     /// not on the module the guest can reach: a run that could re-take its own baseline
     /// could hold the ceiling's worth of memory again after every call.
     fn measure_memory_from_here(&self) {
-        self.faulted_at_start
-            .store(faulted_bytes(), Ordering::Relaxed);
-        self.resident_at_start
-            .store(resident_bytes(), Ordering::Relaxed);
+        if self.memory.rebase().is_err() {
+            self.breach(Stop::Memory);
+            return;
+        }
         // Last, so the host's own watch ([`Self::watch`]) never judges a run against a
         // baseline that is still the one taken when these bounds were built.
         self.measured.store(true, Ordering::SeqCst);
@@ -1814,7 +2001,7 @@ impl Bounds {
     /// that deadline falls, in milliseconds since the epoch, which is what the handler is
     /// told it has left.
     ///
-    /// Called by the HOST, between the two calls it makes into the runtime ([`drive`]), and
+    /// Called by the HOST in [`served`], before the runtime's invoke entry point, and
     /// reachable from no guest code. It is ONE-SHOT and moves NOTHING but this one deadline
     /// besides: a second call answers the same instant, and no memory baseline, step count
     /// or latched stop is touched.
@@ -1835,19 +2022,19 @@ impl Bounds {
     /// when either is spent.
     ///
     /// Called by the host's own watch thread ([`watch_run`]) rather than by the interpreter,
-    /// so what a run is stopped on is the host's own reading and not the guest's traced events:
-    /// a long NATIVE call emits none, and this is what notices a run that has stopped producing
+    /// so what a run is stopped on is the host's own reading and not the guest's instruction
+    /// checkpoints: a long NATIVE call emits none, and this notices a run that stops producing
     /// them — whether it is sitting past its deadline or has taken the process past its ceiling
     /// in ONE allocation. The stop is latched here and raised at the next event the interpreter
     /// does deliver, which is the only place an interpreter can be interrupted; the caller's own
     /// wait and abandoned-run accounting ([`super::run_invocation`]) answer the caller
     /// whatever the run goes on doing.
     ///
-    /// The run's OWN ceiling stays with the hook ([`Self::step`]): it is this THREAD's faulted
-    /// pages, which only the run's own thread can read. The process's resident size is a
+    /// On Unix the run's OWN ceiling stays with the hook ([`Self::step`]): it is this THREAD's
+    /// faulted pages, which only the run's own thread can read. The process's resident size is a
     /// reading any thread can take, so from the instant the run's own code can allocate it is
-    /// taken here as well — a bound sampled only between traced events is one a single native
-    /// allocation would step over, and the module-level code of the deployment package, which
+    /// taken here as well — a bound sampled only between instruction checkpoints is one a
+    /// single native allocation would step over, and the module-level code of the package, which
     /// runs in the INIT phase, allocates as freely as the handler does. That instant is when
     /// the baselines were taken ([`Self::measure_memory_from_here`]), which the host does
     /// before it reads a line of the run's own code: before it, while this emulator is
@@ -1867,7 +2054,10 @@ impl Bounds {
             self.breach(Stop::Deadline);
             return;
         }
-        if self.measured.load(Ordering::SeqCst) && self.past_process_ceiling() {
+        if self.measured.load(Ordering::SeqCst)
+            && (self.memory.past_run_limit_from_watch(self.memory_bytes)
+                || self.past_process_ceiling())
+        {
             self.breach(Stop::Memory);
         }
     }
@@ -1877,8 +2067,8 @@ impl Bounds {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Spend one traced event: `None` to carry on, `Some(stop)` for the bound that is now
-    /// breached.
+    /// Spend one bytecode instruction: `None` to carry on, `Some(stop)` for the bound
+    /// that is now breached.
     fn step(&self) -> Option<Stop> {
         if let Some(stop) = self.stopped() {
             return Some(stop);
@@ -1889,7 +2079,7 @@ impl Bounds {
         if self.clock.now() >= self.deadline() {
             return Some(self.breach(Stop::Deadline));
         }
-        // The run's OWN memory is sampled at EVERY traced event, so there is no sampling
+        // The run's OWN memory is sampled at EVERY instruction, so there is no sampling
         // interval for an allocating guest to outrun: the thread's faulted pages are a
         // counter this process already keeps. The whole process's resident size is read
         // from the operating system, which is the dearer of the two, so that one is read
@@ -1904,13 +2094,11 @@ impl Bounds {
         None
     }
 
-    /// Whether the run has grown past its own ceiling, sampled from OUTSIDE the guest: the
-    /// interpreter exposes no allocation seam, so the bound is read from this thread's
-    /// faulted pages, against what this thread had faulted when the run's own code was
-    /// about to be read ([`Self::measure_memory_from_here`]).
+    /// Whether the run has grown past its own ceiling, measured outside the guest: thread
+    /// faults on Unix, the peak of owned live backing growth on Windows. The baseline is
+    /// the host's, taken before the run's code ([`Self::measure_memory_from_here`]).
     fn past_run_ceiling(&self) -> bool {
-        faulted_bytes().saturating_sub(self.faulted_at_start.load(Ordering::Relaxed))
-            > self.memory_bytes
+        self.memory.past_run_limit(self.memory_bytes)
     }
 
     /// Whether THIS RUN has grown the whole process past [`PROCESS_RESIDENT_CEILING_BYTES`].
@@ -1926,13 +2114,13 @@ impl Bounds {
     ///
     /// Read by the hook and by the host's own watch ([`Self::watch`]), so a run that takes the
     /// process past the ceiling inside one native call is stopped without waiting for the
-    /// guest to deliver another traced event.
+    /// guest to deliver another instruction checkpoint.
     fn past_process_ceiling(&self) -> bool {
-        let held = resident_bytes();
+        let held = memory::resident_bytes();
         if held <= PROCESS_RESIDENT_CEILING_BYTES {
             return false;
         }
-        held.saturating_sub(self.resident_at_start.load(Ordering::Relaxed)) > self.memory_bytes
+        self.memory.past_process_growth(held, self.memory_bytes)
     }
 
     /// Latch `stop` as the run's answer and report it.
@@ -1958,27 +2146,12 @@ impl Bounds {
     }
 }
 
-/// How many bytes of memory THIS thread has faulted in, as the host reports it.
-fn faulted_bytes() -> u64 {
-    match ::nix::sys::resource::getrusage(::nix::sys::resource::UsageWho::RUSAGE_THREAD) {
-        Ok(usage) => {
-            let pages = usage.minor_page_faults().saturating_add(usage.major_page_faults());
-            u64::try_from(pages).unwrap_or(0).saturating_mul(PAGE_BYTES)
-        }
-        Err(_) => 0,
-    }
-}
-
-/// How many bytes this PROCESS holds resident, as the host reports it.
-fn resident_bytes() -> u64 {
-    match ::memory_stats::memory_stats() {
-        Some(stats) => u64::try_from(stats.physical_mem).unwrap_or(0),
-        None => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    //! Successful execution tests require Linux, FreeBSD, OpenBSD, or Windows. Windows
+    //! test binaries must explicitly install the allocation observer. On other hosts, the focused
+    //! `unavailable_memory_accounting_refuses_before_guest_execution` checks refusal.
+
     use super::*;
 
     /// A budget small enough to exhaust in a test and large enough for any handler one
@@ -2012,7 +2185,7 @@ mod tests {
     /// How far ONE reading drives the clock a row about the DEADLINE is judged against.
     ///
     /// A deadline read against a driven clock ([`Clock::driven`]) falls after a NUMBER of
-    /// readings — the run's own traced events, and the host watch's samples of it — rather
+    /// readings — the run's own instructions, and the host watch's samples of it — rather
     /// than after a span of this host's time, so which bound answers such a row is the same
     /// on an idle host and on a loaded one. It is small against the span it has to drive the
     /// clock across, so the phase a row is about is reached long before the readings taken
@@ -2106,9 +2279,418 @@ mod tests {
                 let _ = answered.send(finished);
             })
             .expect("a run thread");
-        answer.recv_timeout(RUN_ANSWER_CEILING).unwrap_or_else(|_| {
-            panic!("case {case}: the run did not end, so no bound of it ended it")
+        answer.recv_timeout(RUN_ANSWER_CEILING).unwrap_or_else(|error| match error {
+            ::std::sync::mpsc::RecvTimeoutError::Timeout => {
+                panic!("case {case}: the run did not end, so no bound of it ended it")
+            }
+            ::std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                panic!("case {case}: the run worker disconnected before returning an answer")
+            }
         })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", windows)))]
+    #[test]
+    fn unavailable_memory_accounting_refuses_before_guest_execution() {
+        let finished = ran(
+            "raise AssertionError('guest code must not run')\ndef handler(event, context):\n    return True",
+            "lambda_function.handler",
+            None,
+        );
+        match &finished.completion {
+            Completion::Internal(message) => assert_eq!(message, MEMORY_ACCOUNTING_UNAVAILABLE),
+            other => panic!("expected unavailable memory accounting, got {other:?}"),
+        }
+        assert!(finished.log.is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", windows))]
+    #[test]
+    fn the_guest_uses_the_supplied_posix_surface_and_expected_platform() {
+        #[cfg(windows)]
+        let expected_platform = "linux";
+        #[cfg(not(windows))]
+        let expected_platform = ::rustpython_vm::stdlib::sys::PLATFORM
+            .to_str()
+            .expect("RustPython's platform is UTF-8");
+        let finished = ran(
+            "import os, sys\ndef handler(event, context):\n    return [sys.platform, os.name]",
+            "lambda_function.handler",
+            None,
+        );
+        assert_eq!(
+            returned(&finished, "guest platform"),
+            ::serde_json::json!([expected_platform, "posix"])
+        );
+    }
+
+    /// A missing sample on reuse or teardown must stop the phase before its first
+    /// guest event; starting the invoke clock cannot clear that stop.
+    #[cfg(not(windows))]
+    #[test]
+    fn unavailable_phase_accounting_latches_a_stop() {
+        let bounds = Bounds::new(
+            &budget(),
+            Clock::still(),
+            memory::RunState::from_sample(1234, None),
+        );
+        assert_eq!(bounds.memory.faulted_at_start(), 1234);
+        assert_eq!(bounds.stopped(), Some(Stop::Memory));
+        bounds.start();
+        assert_eq!(bounds.step(), Some(Stop::Memory));
+    }
+
+    /// A valid new sample, rather than the environment's older reading, owns the phase.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_new_phase_uses_its_successful_accounting_sample() {
+        let bounds = Bounds::new(
+            &budget(),
+            Clock::still(),
+            memory::RunState::from_sample(1234, Some(5678)),
+        );
+        assert_eq!(bounds.memory.faulted_at_start(), 5678);
+        assert_eq!(bounds.stopped(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn csv_rejects_non_string_delimiters_without_native_recursion() {
+        let finished = ran(
+            r#"
+import csv
+import io
+class Recursive:
+    pass
+recursive = Recursive()
+recursive.delimiter = recursive
+class AttributeString:
+    delimiter = '|'
+class AttributeTrap:
+    @property
+    def delimiter(self):
+        raise AssertionError('a delimiter value must not be dereferenced')
+class Dialect:
+    delimiter = '|'
+    quotechar = '"'
+    escapechar = None
+    doublequote = True
+    skipinitialspace = False
+    lineterminator = '\r\n'
+    quoting = csv.QUOTE_MINIMAL
+    strict = False
+class InvalidDialect(Dialect):
+    delimiter = recursive
+def handler(event, context):
+    rejected = 0
+    for value in (recursive, 42, None, '', '||', AttributeString(), AttributeTrap()):
+        for create in (
+            lambda: csv.reader([], delimiter=value),
+            lambda: csv.writer(io.StringIO(), delimiter=value),
+        ):
+            try:
+                create()
+            except TypeError:
+                rejected += 1
+            else:
+                raise AssertionError('a delimiter must be a one-character string')
+    for create in (
+        lambda: csv.reader([], dialect=InvalidDialect),
+        lambda: csv.writer(io.StringIO(), dialect=InvalidDialect),
+    ):
+        try:
+            create()
+        except TypeError:
+            rejected += 1
+        else:
+            raise AssertionError('a dialect delimiter must be a one-character string')
+    assert next(csv.reader(['a|b'], delimiter='|')) == ['a', 'b']
+    assert next(csv.reader(['c|d'], dialect=Dialect)) == ['c', 'd']
+    output = io.StringIO()
+    csv.writer(output, dialect=Dialect).writerow(['a|b', 'c'])
+    return [rejected, output.getvalue()]
+"#,
+            "lambda_function.handler",
+            None,
+        );
+        assert_eq!(
+            returned(&finished, "CSV delimiter validation"),
+            ::serde_json::json!([16, "\"a|b\"|c\r\n"])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn csv_rejects_unsupported_syntax_and_preserves_unicode_fields() {
+        let finished = ran(
+            r#"
+import csv
+import io
+class Dialect:
+    delimiter = '|'
+    quotechar = '"'
+    escapechar = '\\'
+    doublequote = True
+    skipinitialspace = False
+    lineterminator = '\r\n'
+    quoting = csv.QUOTE_MINIMAL
+    strict = False
+def handler(event, context):
+    rejected = 0
+    for name in ('delimiter', 'quotechar', 'escapechar'):
+        for value in ('é', '雪'):
+            options = {name: value}
+            dialect = type('UnsupportedDialect', (Dialect,), options)
+            for create in (
+                lambda: csv.reader([], **options),
+                lambda: csv.writer(io.StringIO(), **options),
+                lambda: csv.reader([], dialect=dialect),
+                lambda: csv.writer(io.StringIO(), dialect=dialect),
+            ):
+                try:
+                    create()
+                except csv.Error as error:
+                    assert 'unsupported' in str(error)
+                    rejected += 1
+                else:
+                    raise AssertionError('unsupported CSV syntax must be refused')
+    fields = ['café', '雪|mountain', '🙂', 'quote "inside"']
+    output = io.StringIO()
+    csv.writer(output, dialect=Dialect).writerow(fields)
+    decoded = next(csv.reader(io.StringIO(output.getvalue()), dialect=Dialect))
+    return [rejected, decoded]
+"#,
+            "lambda_function.handler",
+            None,
+        );
+        assert_eq!(
+            returned(&finished, "CSV Unicode fields and syntax refusal"),
+            ::serde_json::json!([24, ["café", "雪|mountain", "🙂", "quote \"inside\""]])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn csv_writer_callbacks_can_reenter_without_a_native_lock() {
+        let finished = ran(
+            r#"
+import csv
+class Sink:
+    def __init__(self):
+        self.rows = []
+        self.entered = False
+    def write(self, text):
+        if not self.entered:
+            self.entered = True
+            self.writer.writerow(['inner'])
+        self.rows.append(text)
+        return len(text)
+def handler(event, context):
+    sink = Sink()
+    sink.writer = csv.writer(sink)
+    written = sink.writer.writerow(['outer'])
+    sink.writer.writerow(['after'])
+    return [sink.rows, written]
+"#,
+            "lambda_function.handler",
+            None,
+        );
+        assert_eq!(
+            returned(&finished, "CSV writer reentry"),
+            ::serde_json::json!([["inner\r\n", "outer\r\n", "after\r\n"], 7])
+        );
+    }
+
+    #[cfg(windows)]
+    mod windows_accounting {
+        use super::*;
+        use ::aws_emulator_windows_support::allocation::{
+            allocation_observer_installed, AllocationOwner,
+        };
+
+        /// Exercise real prepared interpreters on the same stack and worker ownership
+        /// boundary as Lambda. The caller still has a bounded wait if a native call hangs.
+        fn in_environment(
+            source: &'static str,
+            memory_bytes: u64,
+            test: impl FnOnce(&Prepared, &Run<'_>, &Clock) + Send + 'static,
+        ) {
+            let (sent, received) = ::std::sync::mpsc::channel();
+            ::std::thread::Builder::new()
+                .stack_size(crate::state::execution::RUN_STACK_BYTES)
+                .spawn(move || {
+                    let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                        let modules = vec![PackageModule {
+                            path: "lambda_function.py".to_owned(),
+                            source: source.to_owned(),
+                        }];
+                        let environment = BTreeMap::new();
+                        let mut limits = budget();
+                        limits.memory_bytes = memory_bytes;
+                        let request = Run {
+                            modules: &modules,
+                            handler: "lambda_function.handler",
+                            environment: &environment,
+                            event: None,
+                            request_id: "11111111-2222-3333-4444-555555555555",
+                            invoked_function_arn:
+                                "arn:aws:lambda:us-west-2:000000000000:function:ownership",
+                            client_context: None,
+                            tenant_id: None,
+                            budget: limits,
+                            aws: None,
+                        };
+                        let clock = Clock::still();
+                        let prepared = Prepared::start(&request, &clock)
+                            .unwrap_or_else(|failure| panic!("initialization failed: {failure:?}"));
+                        test(&prepared, &request, &clock);
+                        prepared.finalize(limits, &clock);
+                    }));
+                    let _ = sent.send(result);
+                })
+                .expect("start a Python ownership test worker");
+            match received.recv_timeout(RUN_ANSWER_CEILING) {
+                Ok(Ok(())) => {}
+                Ok(Err(panic)) => ::std::panic::resume_unwind(panic),
+                Err(error) => panic!("Python ownership test did not finish: {error}"),
+            }
+        }
+
+        const MEMORY: u64 = 64 * 1024 * 1024;
+
+        #[test]
+        fn shared_watch_registry_growth_does_not_charge_any_environment() {
+            assert!(allocation_observer_installed());
+            // A fresh registry exercises the production registration path without
+            // removing watches belonging to concurrently running tests. Keep every
+            // Bounds alive so retain cannot hide the capacity growth being tested.
+            let registry = Mutex::new(Vec::new());
+            let first_owner = AllocationOwner::new();
+            let second_owner = AllocationOwner::new();
+            let first = Arc::new(Bounds::new(
+                &budget(),
+                Clock::still(),
+                memory::RunState::new(first_owner.clone()),
+            ));
+            {
+                let scope = first_owner.enter();
+                assert!(scope.is_established());
+                register_watched_run(&first, &registry);
+            }
+            assert_eq!(first.stopped(), None);
+            let before = first_owner.snapshot();
+            assert_eq!(before.live_bytes, 0, "watch startup is host bookkeeping");
+            let initial_capacity = registry.lock().unwrap().capacity();
+            let later: Vec<_> = (0..=initial_capacity)
+                .map(|_| {
+                    Arc::new(Bounds::new(
+                        &budget(),
+                        Clock::still(),
+                        memory::RunState::new(second_owner.clone()),
+                    ))
+                })
+                .collect();
+            {
+                let scope = second_owner.enter();
+                assert!(scope.is_established());
+                for bounds in &later {
+                    register_watched_run(bounds, &registry);
+                }
+            }
+            assert!(registry.lock().unwrap().capacity() > initial_capacity);
+            assert_eq!(first_owner.snapshot(), before, "idle A must not own B's registry growth");
+            assert_eq!(second_owner.snapshot().live_bytes, 0);
+            assert!(later.iter().all(|bounds| bounds.stopped().is_none()));
+        }
+
+        #[test]
+        fn unrelated_allocations_do_not_grow_or_stop_a_warm_environment() {
+            in_environment(
+                "def handler(event, context):\n    return 7\n",
+                MEMORY,
+                |prepared, request, clock| {
+                    let first = prepared.invoke(request, clock);
+                    assert_eq!(returned(&first, "first invocation"), ::serde_json::json!(7));
+                    let before = prepared.grown_bytes();
+                    let (ready, running) = ::std::sync::mpsc::channel();
+                    let (release, released) = ::std::sync::mpsc::channel();
+                    let unrelated = ::std::thread::spawn(move || {
+                        let memory = vec![1_u8; 128 * 1024 * 1024];
+                        ::std::hint::black_box(&memory);
+                        ready.send(()).expect("report live unrelated memory");
+                        released.recv().expect("release unrelated memory");
+                        ::std::hint::black_box(memory);
+                    });
+                    running.recv().expect("unrelated memory is live");
+                    let while_idle = prepared.grown_bytes();
+                    let second = prepared.invoke(request, clock);
+                    release.send(()).expect("release unrelated worker");
+                    unrelated.join().expect("unrelated worker finished");
+                    assert_eq!(while_idle, before, "an idle owner must not charge peer traffic");
+                    assert_eq!(returned(&second, "warm invocation"), ::serde_json::json!(7));
+                },
+            );
+        }
+
+        #[test]
+        fn warm_globals_persist_and_their_owned_growth_reaches_retirement() {
+            in_environment(
+                "KEPT = []\ndef handler(event, context):\n    \
+                 KEPT.append(bytearray(40 * 1024 * 1024))\n    return len(KEPT)\n",
+                MEMORY,
+                |prepared, request, clock| {
+                    let first = prepared.invoke(request, clock);
+                    assert_eq!(returned(&first, "first retained allocation"), ::serde_json::json!(1));
+                    assert!(
+                        prepared.grown_bytes() <= MEMORY,
+                        "first retained allocation must remain reusable"
+                    );
+                    let second = prepared.invoke(request, clock);
+                    assert_eq!(returned(&second, "second retained allocation"), ::serde_json::json!(2));
+                    // The pool retires an environment once this reading exceeds its
+                    // function's memory ceiling, even when each invocation fits alone.
+                    assert!(prepared.grown_bytes() > MEMORY);
+                },
+            );
+        }
+
+        #[test]
+        fn a_warm_zlib_copy_and_decompression_charge_their_output() {
+            in_environment(
+                "import zlib\nPACKED = zlib.compress(b'x' * (8 * 1024 * 1024))\n\
+                 CALLS = 0\ndef handler(event, context):\n    global CALLS\n    CALLS += 1\n    \
+                 if CALLS == 1:\n        return 0\n    \
+                 stream = zlib.decompressobj().copy()\n    \
+                 return len(stream.decompress(PACKED))\n",
+                MEMORY,
+                |prepared, request, clock| {
+                    let first = prepared.invoke(request, clock);
+                    assert_eq!(returned(&first, "zlib preparation"), ::serde_json::json!(0));
+                    let second = prepared.invoke(request, clock);
+                    assert_eq!(returned(&second, "zlib output"), ::serde_json::json!(8 * 1024 * 1024));
+                    let bounds = prepared.session.bounds();
+                    assert!(bounds.memory.peak_growth_bytes() >= 8 * 1024 * 1024);
+                },
+            );
+        }
+
+        #[test]
+        fn scrypt_scratch_memory_is_seen_inside_the_native_call() {
+            in_environment(
+                "import hashlib\ndef handler(event, context):\n    \
+                 return len(hashlib.scrypt(b'password', salt=b'salt', n=16384, r=8, p=1, \
+                 maxmem=64 * 1024 * 1024, dklen=16))\n",
+                MEMORY,
+                |prepared, request, clock| {
+                    let finished = prepared.invoke(request, clock);
+                    assert_eq!(returned(&finished, "scrypt result"), ::serde_json::json!(16));
+                    // The scratch buffer is gone before Python reaches its next checkpoint.
+                    // The retained peak, rather than that later live reading, sees it.
+                    let bounds = prepared.session.bounds();
+                    assert!(bounds.memory.peak_growth_bytes() >= 16 * 1024 * 1024);
+                },
+            );
+        }
     }
 
     /// The JSON the handler returned, or a panic naming what it came to instead.
@@ -2312,8 +2894,8 @@ mod tests {
     /// judged against a clock that does not advance — which is what keeps a host slow enough
     /// to spend the deadline from answering the row with the deadline instead of with the
     /// bound the row is about. The MEMORY ceiling is put out of reach of every row but the
-    /// one about it for the same reason ([`CEILING_OUT_OF_REACH`]). The last two rows are the
-    /// same guest code under two different runs, so what differs between their answers is the
+    /// one about it for the same reason ([`CEILING_OUT_OF_REACH`]). The first and last rows
+    /// run the same loop under two different budgets, so what differs between their answers is the
     /// bound each run left reachable and nothing of the host.
     #[test]
     fn a_run_that_breaches_a_bound_is_stopped_by_it() {
@@ -2326,28 +2908,28 @@ mod tests {
             body: &'a str,
             /// The bound that has to end the run.
             expected: Stop,
+            /// Whether the interpreter's own recursion limit may answer this row.
+            allows_recursion_error: bool,
             /// The clock the run's deadline is read against.
             clock: Clock,
-            /// How many traced events the run may spend: a row about the DEADLINE has to
-            /// reach it before the step budget answers instead.
+            /// How many instructions the run may spend.
             steps: u64,
             /// How long the handler may run for, in that clock's own time.
             wall_clock: Duration,
             /// How much memory the run may add to this process.
             memory_bytes: u64,
         }
-        // Enough events for a row about another bound to reach it, and far fewer than a row
-        // about the deadline drives its clock across.
+        // Only step-bound rows shorten the ordinary instruction budget.
         let few_steps = 50_000;
-        let many_steps = 2_000_000_000;
-        // Small enough that an allocating handler passes it inside the step budget, and far
-        // above what building the interpreter itself faults in.
+        // The memory row retains twice this ceiling in populated buffers. If memory
+        // enforcement fails, it returns after allocating a finite amount.
         let reachable_ceiling = 64 * 1024 * 1024;
         let cases = vec![
             BoundCase {
                 case: "a loop with no exit",
                 body: "while True:\n        pass\n",
                 expected: Stop::Steps,
+                allows_recursion_error: false,
                 clock: Clock::still(),
                 steps: few_steps,
                 wall_clock: budget().wall_clock,
@@ -2357,6 +2939,7 @@ mod tests {
                 case: "unbounded recursion",
                 body: "def deep(n):\n        return deep(n + 1)\n    deep(0)\n",
                 expected: Stop::Steps,
+                allows_recursion_error: true,
                 clock: Clock::still(),
                 steps: few_steps,
                 wall_clock: budget().wall_clock,
@@ -2366,19 +2949,20 @@ mod tests {
                 case: "a response larger than one may be",
                 body: "return 'x' * 200000\n",
                 expected: Stop::Response,
+                allows_recursion_error: false,
                 clock: Clock::still(),
-                steps: few_steps,
+                steps: budget().steps,
                 wall_clock: budget().wall_clock,
                 memory_bytes: CEILING_OUT_OF_REACH,
             },
             BoundCase {
-                case: "an allocating loop",
-                body: "kept = []\n    \
-                       while True:\n        \
-                           kept.append(bytearray(1024 * 1024))\n",
+                case: "retained allocations exceeding the memory ceiling",
+                body: "kept = [bytearray(b'x' * (1024 * 1024)) for _ in range(128)]\n    \
+                       return len(kept)\n",
                 expected: Stop::Memory,
+                allows_recursion_error: false,
                 clock: Clock::still(),
-                steps: few_steps,
+                steps: budget().steps,
                 wall_clock: budget().wall_clock,
                 memory_bytes: reachable_ceiling,
             },
@@ -2387,14 +2971,18 @@ mod tests {
                        deadline",
                 body: "while True:\n        pass\n",
                 expected: Stop::Deadline,
+                allows_recursion_error: false,
                 clock: Clock::driven(DRIVEN_TICK),
-                steps: many_steps,
+                steps: budget().steps,
                 wall_clock: Duration::from_secs(1),
                 memory_bytes: CEILING_OUT_OF_REACH,
             },
         ];
         for case in &cases {
-            let source = format!("def handler(event, context):\n    {}", case.body);
+            let source = format!(
+                "def handler(event, context):\n    print('bound-body-entered')\n    {}",
+                case.body
+            );
             let mut tight = budget();
             tight.steps = case.steps;
             tight.wall_clock = case.wall_clock;
@@ -2408,11 +2996,20 @@ mod tests {
                 &case.clock,
                 case.case,
             );
+            assert!(
+                finished
+                    .log
+                    .lines()
+                    .any(|line| line == "bound-body-entered"),
+                "case {}: handler body was not reached: {finished:?}",
+                case.case
+            );
             let stopped = match &finished.completion {
                 Completion::Stopped(stop) => Some(*stop),
                 // Deep recursion may end at the interpreter's own clamped limit first,
                 // which is also the host's bound doing its job.
-                Completion::Raised { error_type, .. } if error_type == "RecursionError" => None,
+                Completion::Raised { error_type, .. }
+                    if case.allows_recursion_error && error_type == "RecursionError" => None,
                 other => panic!("case {}: expected a stop, got {other:?}", case.case),
             };
             if let Some(stopped) = stopped {
@@ -2434,21 +3031,27 @@ mod tests {
     fn a_guest_that_catches_the_stop_is_still_stopped() {
         let source = "def handler(event, context):\n    \
                           try:\n        \
+                              print('caught-stop-body-entered')\n        \
                               while True:\n            \
                                   pass\n    \
                           except BaseException:\n        \
                               return {'escaped': True}\n";
-        let mut tight = budget();
-        tight.steps = 20_000;
         let case = "a guest that catches the stop it was given";
         let finished = ran_against(
             source,
             "lambda_function.handler",
             None,
             &BTreeMap::new(),
-            tight,
+            budget(),
             &Clock::still(),
             case,
+        );
+        assert!(
+            finished
+                .log
+                .lines()
+                .any(|line| line == "caught-stop-body-entered"),
+            "case {case}: guest body was not reached: {finished:?}"
         );
         assert!(
             matches!(finished.completion, Completion::Stopped(Stop::Steps)),
@@ -2589,28 +3192,32 @@ mod tests {
     fn a_guest_that_rebinds_the_host_module_is_still_bounded() {
         let source = "def handler(event, context):\n    \
                           host = __import__('_lambda_host')\n    \
+                          write_log = host.log\n    \
                           for name in dir(host) + ['step']:\n        \
                               try:\n            \
                                   setattr(host, name, lambda *a, **k: None)\n        \
                               except Exception:\n            \
                                   pass\n    \
+                          write_log('rebound-body-entered\\n')\n    \
                           while True:\n        \
                               pass\n";
-        let mut tight = budget();
-        // A small STEP budget, so the stop the guest cannot reach arrives at once: with the
-        // hook switched off nothing would arrive at all. The run is judged against a clock
-        // that does not advance, so that budget is the only bound that can answer it and
-        // nothing of this host's own speed decides what the row came to.
-        tight.steps = 20_000;
+        // A still clock leaves the instruction budget to stop the guest loop.
         let case = "a guest that rebound every name the host module carries";
         let finished = ran_against(
             source,
             "lambda_function.handler",
             None,
             &BTreeMap::new(),
-            tight,
+            budget(),
             &Clock::still(),
             case,
+        );
+        assert!(
+            finished
+                .log
+                .lines()
+                .any(|line| line == "rebound-body-entered"),
+            "case {case}: guest body was not reached: {finished:?}"
         );
         assert!(
             matches!(finished.completion, Completion::Stopped(Stop::Steps)),
@@ -2715,7 +3322,7 @@ mod tests {
             let mut tight = budget();
             // The bound each row names has to be the only one that can answer it, and WHICH
             // clock the run's deadline is read against is what settles that: the row about
-            // the DEADLINE is judged against a clock its own traced events drive, so the
+            // the DEADLINE is judged against a clock its own instructions drive, so the
             // deadline falls after a number of events rather than after a span of this
             // host's time, and the row about the BASELINE against a clock that does not
             // advance, so no deadline falls for it at all however slowly this host faults
@@ -2747,34 +3354,389 @@ mod tests {
         }
     }
 
+    /// A stopped worker must unwind through guest handlers and finish teardown.
+    #[test]
+    fn caught_stops_cannot_resume_guest_code() {
+        let guarded = "print('checkpoint-entered')\n\
+                       try:\n    \
+                           try:\n        \
+                               while True: pass\n    \
+                           except BaseException:\n        \
+                               while True: pass\n\
+                       finally:\n    \
+                           while True: pass\n";
+        let in_function = |name: &str| {
+            format!(
+                "def {name}():\n{}",
+                guarded
+                    .lines()
+                    .map(|line| format!("    {line}\n"))
+                    .collect::<String>()
+            )
+        };
+        let cases = [
+            ("initialization", format!("{guarded}\ndef handler(event, context): return None\n")),
+            ("invocation", format!("{}\ndef handler(event, context): return spin()\n", in_function("spin"))),
+            ("finalization", format!("import atexit\n{}\ndef handler(event, context):\n    atexit.register(spin)\n    return None\n", in_function("spin"))),
+            ("call_tracing", format!("import sys\n{}\ndef handler(event, context): return sys.call_tracing(spin, ())\n", in_function("spin"))),
+            ("collector callback", format!("import gc\n{}\ndef handler(event, context):\n    gc.callbacks.append(lambda phase, info: spin())\n    gc.collect()\n    return None\n", in_function("spin"))),
+            ("collector finalizer", format!("import gc\n{}\nclass Cycle:\n    def __del__(self): spin()\ndef handler(event, context):\n    gc.disable()\n    cycle = Cycle()\n    cycle.self = cycle\n    del cycle\n    gc.enable()\n    gc.collect()\n    return None\n", in_function("spin"))),
+        ];
+        for (case, source) in cases {
+            let mut tight = budget();
+            tight.steps = 200_000;
+            let finished = ran_against(
+                &source,
+                "lambda_function.handler",
+                None,
+                &BTreeMap::new(),
+                tight,
+                &Clock::still(),
+                case,
+            );
+            assert!(
+                finished
+                    .log
+                    .lines()
+                    .any(|line| line == "checkpoint-entered"),
+                "case {case}: guest body was not reached: {finished:?}"
+            );
+            assert!(
+                matches!(finished.completion, Completion::Stopped(Stop::Steps)),
+                "case {case}: {finished:?}"
+            );
+        }
+    }
+
+    /// Replacing metadata on code that has run preserves its ordinary return value.
+    #[test]
+    fn replacing_executed_code_preserves_its_return_value() {
+        let source = r#"def copied():
+    value = 0
+    while value < 3:
+        value += 1
+    return value
+
+def handler(event, context):
+    before = copied()
+    copied.__code__ = copied.__code__.replace(co_name='copied_again')
+    return [before, copied()]
+"#;
+        let finished = ran(source, "lambda_function.handler", None);
+        assert_eq!(
+            returned(&finished, "copying executed code"),
+            ::serde_json::json!([3, 3])
+        );
+    }
+
+    /// Frame tracing and code-object changes cannot remove instruction checkpoints.
+    #[test]
+    fn guest_frame_and_code_changes_cannot_remove_bounds() {
+        let cases = [
+            ("frame tracing", "import sys\ndef handler(event, context):\n    frame = sys._getframe()\n    frame.f_trace = None\n    frame.f_trace_lines = False\n    frame.f_trace_opcodes = False\n    print('checkpoint-entered')\n    while True: pass\n", 200_000),
+            (
+                "code without line entries",
+                r#"import opcode
+
+def spin(): return 7
+
+def handler(event, context):
+    spin.__code__ = spin.__code__.replace(co_linetable=b'')
+    assert spin() == 7
+    code = (bytes([opcode.opmap['RESUME'], 0])
+            + bytes([opcode.opmap['CACHE'], 0]) * opcode._inline_cache_entries['RESUME']
+            + bytes([opcode.opmap['JUMP_BACKWARD_NO_INTERRUPT'], 1]))
+    spin.__code__ = spin.__code__.replace(co_code=code, co_linetable=b'')
+    assert spin.__code__.co_linetable == b''
+    print('checkpoint-entered')
+    return spin()
+"#,
+                200_000,
+            ),
+            (
+                "copying code after it has run",
+                r#"def copied(loop):
+    if loop:
+        print('checkpoint-entered')
+    value = 0
+    while loop or value < 3:
+        value += 1
+    return value
+
+def handler(event, context):
+    assert copied(False) == 3
+    copied.__code__ = copied.__code__.replace(co_name='copied_again')
+    assert copied(False) == 3
+    return copied(True)
+"#,
+                200_000,
+            ),
+            ("collector-visible callbacks", "import gc, types\ndef handler(event, context):\n    callbacks = [obj for obj in gc.get_objects() if isinstance(obj, types.BuiltinFunctionType) and obj.__name__ in {'__lambda_step', '__lambda_stop'}]\n    assert len(callbacks) == 2\n    for callback in callbacks:\n        for name in ['__call__', '__code__', '__defaults__']:\n            try:\n                setattr(callback, name, (lambda: None).__code__ if name == '__code__' else lambda: None)\n            except (AttributeError, TypeError):\n                pass\n        callback.__module__ = 'guest'\n        callback()\n    print('checkpoint-entered')\n    try:\n        while True: pass\n    except BaseException:\n        while True: pass\n", budget().steps),
+        ];
+        for (case, source, steps) in cases {
+            let tight = Budget { steps, ..budget() };
+            let finished = ran_against(
+                source,
+                "lambda_function.handler",
+                None,
+                &BTreeMap::new(),
+                tight,
+                &Clock::still(),
+                case,
+            );
+            assert!(
+                finished
+                    .log
+                    .lines()
+                    .any(|line| line == "checkpoint-entered"),
+                "case {case}: guest body was not reached: {finished:?}"
+            );
+            assert!(
+                matches!(finished.completion, Completion::Stopped(Stop::Steps)),
+                "case {case}: {finished:?}"
+            );
+        }
+    }
+
+    /// Give a prepared-environment check its own budget, with the same stack and bounded
+    /// join as a run.
+    fn in_bound_environment(
+        source: &'static str,
+        limits: Budget,
+        test: impl FnOnce(Prepared, &Run<'_>, &Clock) + Send + 'static,
+    ) {
+        let (sent, received) = ::std::sync::mpsc::channel();
+        ::std::thread::Builder::new()
+            .stack_size(crate::state::execution::RUN_STACK_BYTES)
+            .spawn(move || {
+                let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    let modules = vec![PackageModule {
+                        path: "lambda_function.py".to_owned(),
+                        source: source.to_owned(),
+                    }];
+                    let environment = BTreeMap::new();
+                    let request = Run {
+                        modules: &modules,
+                        handler: "lambda_function.handler",
+                        environment: &environment,
+                        event: None,
+                        request_id: "11111111-2222-3333-4444-555555555555",
+                        invoked_function_arn:
+                            "arn:aws:lambda:us-west-2:000000000000:function:bounds",
+                        client_context: None,
+                        tenant_id: None,
+                        budget: limits,
+                        aws: None,
+                    };
+                    let clock = Clock::still();
+                    let prepared =
+                        Prepared::start(&request, &clock).expect("interpreter initialized");
+                    test(prepared, &request, &clock);
+                }));
+                let _ = sent.send(result);
+            })
+            .expect("start a Python bounds worker");
+        match received.recv_timeout(RUN_ANSWER_CEILING) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => ::std::panic::resume_unwind(panic),
+            Err(error) => panic!("Python bounds worker did not finish: {error}"),
+        }
+    }
+
+    /// Retiring a stopped invocation binds fresh finalization bounds to the same monitor.
+    #[test]
+    fn finalization_after_a_stop_has_its_own_active_bounds() {
+        in_bound_environment(
+            "import atexit\ndef cleanup():\n    print('finalizer-entered')\n    try:\n        while True: pass\n    except BaseException:\n        while True: pass\natexit.register(cleanup)\ndef handler(event, context):\n    print('invoke-entered')\n    while True: pass\n",
+            Budget {
+                steps: 200_000,
+                ..budget()
+            },
+            |prepared, request, clock| {
+                let invoked = prepared.invoke(request, clock);
+                let session = Arc::clone(&prepared.session);
+                prepared.finalize(request.budget, clock);
+                let stopped = session.bounds().stopped();
+                let log = captured(&session.capture()).text.clone();
+                assert!(
+                    invoked.log.lines().any(|line| line == "invoke-entered"),
+                    "{invoked:?}"
+                );
+                assert!(matches!(invoked.completion, Completion::Stopped(Stop::Steps)), "{invoked:?}");
+                assert!(log.lines().any(|line| line == "finalizer-entered"), "{log}");
+                assert_eq!(stopped, Some(Stop::Steps));
+            },
+        );
+    }
+
+    /// Constructing a stop cannot collect a guest finalizer under suppressed monitoring.
+    #[test]
+    fn stop_exceptions_preserve_collection_without_running_finalizers() {
+        in_bound_environment(
+            "import gc\ngc.disable()\nEVENTS = []\nclass Finalizable:\n    def __del__(self): EVENTS.append('collected')\ncycle = Finalizable()\ncycle.self = cycle\ndel cycle\ndef handler(event, context): return True\n",
+            Budget {
+                steps: 200_000,
+                ..budget()
+            },
+            |prepared, request, clock| {
+                prepared.interpreter.enter(|vm| {
+                    let module = vm.import("lambda_function", 0).expect("guest module");
+                    let events: ::rustpython_vm::builtins::PyListRef = module
+                        .get_attr("EVENTS", vm).expect("finalizer events")
+                        .try_into_value(vm).expect("event list");
+                    vm.state.gc.set_threshold(1, Some(1), Some(1));
+                    for enabled in [false, true] {
+                        if enabled { vm.state.gc.enable(); } else { vm.state.gc.disable(); }
+                        let exception = stop_exception(vm, Stop::Steps);
+                        assert_eq!(vm.state.gc.is_enabled(), enabled);
+                        assert!(events.borrow_vec().is_empty(), "finalizer ran while creating the stop");
+                        vm.state.gc.disable();
+                        drop(exception);
+                    }
+                    vm.state.gc.collect_force(2);
+                    assert_eq!(events.borrow_vec().len(), 1, "the pending finalizer must remain collectable");
+                    vm.state.gc.enable();
+                });
+                prepared.finalize(request.budget, clock);
+            },
+        );
+    }
+
+    /// Monitoring controls are absent even from the collector's live-object view.
+    /// Ordinary collection and calls through sys.call_tracing still work.
+    #[test]
+    fn guest_introspection_cannot_recover_monitoring_controls() {
+        let source = r#"
+import gc, importlib, importlib.machinery, _imp, sys, types
+
+def handler(event, context):
+    controls = {
+        'sys': {'settrace', 'setprofile', '_settraceallthreads', '_setprofileallthreads', 'addaudithook'},
+        'sys.monitoring': {'use_tool_id', 'clear_tool_id', 'free_tool_id', 'register_callback', 'set_events', 'set_local_events', 'restart_events'},
+    }
+    exposed = [name for name in controls['sys'] if hasattr(sys, name)]
+    if hasattr(sys, 'monitoring') or 'sys.monitoring' in sys.modules:
+        exposed.append('monitoring')
+    try:
+        __import__('sys.monitoring')
+        exposed.append('imported-monitoring')
+    except ImportError:
+        pass
+    factories = [getattr(_imp, name) for name in
+                 ('create_builtin', 'exec_builtin', 'create_dynamic', 'exec_dynamic')]
+    for obj in gc.get_objects():
+        if isinstance(obj, types.BuiltinFunctionType):
+            name = getattr(obj, '__name__', None)
+            if any(name in names for names in controls.values()):
+                exposed.append(name)
+            if name in {'create_builtin', 'exec_builtin', 'create_dynamic', 'exec_dynamic'}:
+                if all(obj is not factory for factory in factories):
+                    exposed.append('unpatched-' + name)
+    loader = importlib.machinery.BuiltinImporter
+    spec = importlib.machinery.ModuleSpec('sys', loader)
+    refused = 0
+    for callback, argument in [
+        (importlib.reload, sys),
+        (_imp.create_builtin, spec),
+        (_imp.exec_builtin, sys),
+        (_imp.create_dynamic, spec),
+        (_imp.exec_dynamic, sys),
+        (_imp.init_frozen, 'sys'),
+        (_imp.init_frozen, 'sys.monitoring'),
+        (_imp.get_frozen_object, 'sys'),
+        (_imp.get_frozen_object, 'sys.monitoring'),
+        (loader.create_module, spec),
+        (loader.exec_module, sys),
+    ]:
+        try:
+            callback(argument)
+        except ImportError:
+            refused += 1
+    saved = sys.modules.pop('sys')
+    try:
+        try:
+            __import__('sys')
+        except ImportError:
+            refused += 1
+    finally:
+        sys.modules['sys'] = saved
+    gc.collect()
+    return {'exposed': sorted(exposed), 'refused': refused,
+            'called': sys.call_tracing(lambda: 7, ())}
+"#;
+        let finished = ran(source, "lambda_function.handler", None);
+        assert_eq!(
+            returned(&finished, "monitoring controls"),
+            ::serde_json::json!({"exposed": [], "refused": 12, "called": 7})
+        );
+    }
+
+    /// Cached module metadata from one guest cannot choose another interpreter's events.
+    #[test]
+    fn guest_monitoring_metadata_cannot_poison_the_next_interpreter() {
+        in_bound_environment(
+            "import gc, types\ndef handler(event, context):\n    events = [obj for obj in gc.get_objects() if isinstance(obj, types.SimpleNamespace) and hasattr(obj, 'INSTRUCTION') and hasattr(obj, 'EXCEPTION_HANDLED')]\n    assert len(events) == 1\n    events[0].INSTRUCTION = events[0].LINE\n    events[0].EXCEPTION_HANDLED = events[0].LINE\n    return len(events)\n",
+            budget(),
+            |prepared, request, clock| {
+                let poisoned = prepared.invoke(request, clock);
+                prepared.finalize(request.budget, clock);
+                assert_eq!(returned(&poisoned, "cached events poisoned"), ::serde_json::json!(1));
+                let modules = vec![PackageModule {
+                    path: "lambda_function.py".to_owned(),
+                    source: "def handler(event, context):\n    print('checkpoint-entered')\n    try:\n        while True: pass\n    except BaseException:\n        while True: pass\n".to_owned(),
+                }];
+                let next = Run {
+                    modules: &modules,
+                    budget: Budget {
+                        steps: 200_000,
+                        ..request.budget
+                    },
+                    ..*request
+                };
+                let finished = run_against(&next, clock);
+                assert!(
+                    finished
+                        .log
+                        .lines()
+                        .any(|line| line == "checkpoint-entered"),
+                    "{finished:?}"
+                );
+                assert!(matches!(finished.completion, Completion::Stopped(Stop::Steps)), "{finished:?}");
+            },
+        );
+    }
+
     /// A guest `atexit` callback runs during the interpreter's finalization, which is after
     /// the handler returned — and it is bounded like every other guest frame: the hook is
-    /// still installed and still answers itself as the local tracer, so a callback that spins
-    /// is stopped on one of the run's own bounds rather than wedging the thread.
+    /// still installed, so a callback that spins is stopped on one of the run's own bounds
+    /// rather than wedging the thread.
     #[test]
     fn a_guest_atexit_callback_is_bounded_like_the_handler() {
         let source = "import atexit\n\
                       def spin():\n    \
+                          print('atexit-body-entered')\n    \
                           while True:\n        \
                               pass\n\
                       def handler(event, context):\n    \
                           atexit.register(spin)\n    \
                           return {'registered': True}\n";
-        let mut tight = budget();
-        // The callback is stopped on a budget, so this row is about WHETHER it is bounded and
-        // not about how much it is given: a small step budget keeps the spin short, and a
-        // clock that does not advance leaves that budget the only bound that can answer the
-        // run — the stop here is the callback's own spending and not this host's speed.
-        tight.steps = 20_000;
+        // A still clock leaves the instruction budget to stop the callback.
         let case = "an atexit callback that spins during the interpreter's finalization";
         let finished = ran_against(
             source,
             "lambda_function.handler",
             None,
             &BTreeMap::new(),
-            tight,
+            budget(),
             &Clock::still(),
             case,
+        );
+        assert!(
+            finished
+                .log
+                .lines()
+                .any(|line| line == "atexit-body-entered"),
+            "case {case}: guest body was not reached: {finished:?}"
         );
         assert!(
             matches!(finished.completion, Completion::Stopped(Stop::Steps)),

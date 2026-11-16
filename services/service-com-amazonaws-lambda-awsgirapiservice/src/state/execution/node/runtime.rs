@@ -11,8 +11,7 @@
 //! `Error`'s own `stack` is the trace.
 //!
 //! What it is NOT is the containment or the bounds. The whole host surface of a run is the
-//! three functions [`super::install_host`] installs — the invocation log, a package entry's
-//! source, and a core module's source — and this source takes all three off the global
+//! functions [`super::install_host`] installs, and this source takes them off the global
 //! object once it holds them. The deadline, the step ceiling and the memory ceiling are the
 //! engine's and the host's ([`super::Bounds`]), so no rebinding or deletion of a name here
 //! can lift one.
@@ -21,7 +20,7 @@
 //! host's own engine surface stays as small as a string in and a string out:
 //!
 //! * `start(input)` — begins the invocation the JSON document `input` describes: the
-//!   handler name, the event, the environment the invocation runs with, and the deadline.
+//!   handler name, the event, and the environment the invocation runs with.
 //! * `poll()` — the JSON document of what the invocation came to, once it has, and `null`
 //!   while it has not.
 //! * `waiting()` — what an unsettled invocation is waiting for: the promise an
@@ -58,6 +57,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     var hostEncode = globalThis.__hostEncode;
     var hostDecode = globalThis.__hostDecode;
     var hostBeginInvocation = globalThis.__hostBeginInvocation;
+    var hostRemainingTimeInMillis = globalThis.__hostRemainingTimeInMillis;
     delete globalThis.__hostLog;
     delete globalThis.__hostModuleSource;
     delete globalThis.__hostModulePaths;
@@ -71,6 +71,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     delete globalThis.__hostEncode;
     delete globalThis.__hostDecode;
     delete globalThis.__hostBeginInvocation;
+    delete globalThis.__hostRemainingTimeInMillis;
 
     // Dynamic import is the one way a module of the package is loaded as an ES module. It
     // is compiled here, once, so a run never depends on it being available at any later
@@ -1391,7 +1392,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             clientContext: input.clientContext === null ? undefined : input.clientContext,
             tenantId: input.tenantId === null ? undefined : input.tenantId,
             getRemainingTimeInMillis: function () {
-                return Math.max(0, Math.floor(input.deadlineEpochMs - Date.now()));
+                return hostRemainingTimeInMillis();
             }
         };
         // The legacy completion API a node context carries beside the callback:
@@ -1591,9 +1592,9 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             // The INIT phase is over here: the engine, this runtime and the handler's own
             // module are all loaded and its entry point is resolved. None of that is the
             // handler's run, which is what the function's `Timeout` bounds, so the host is
-            // told the invoke phase begins now and answers the instant that `Timeout` is up
-            // at — which is what the context reports as the time remaining.
-            input.deadlineEpochMs = hostBeginInvocation();
+            // told the invoke phase begins now. The context reads the time remaining from
+            // that same host deadline.
+            hostBeginInvocation();
             return callHandler(entry, event, makeContext(input));
         }, function (error) {
             // How the node runtime classifies a module that would not load: a module it

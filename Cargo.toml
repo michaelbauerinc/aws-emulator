@@ -466,6 +466,10 @@ split-debuginfo = "unpacked"
 [profile.dev.package."*"]
 debug = false
 
+# The unoptimized VM dispatch creates large native stack frames.
+[profile.dev.package.rustpython-vm]
+opt-level = 3
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -944,3 +948,11 @@ rustls-webpki = "0.103"
 aws-sigv4 = { version = "1", features = ["http1"] }
 aws-credential-types = "1"
 nix = { version = "0.31", features = ["signal"] }
+
+# Pin RustPython's monitoring code-object fix and its matching libraries together.
+[patch.crates-io]
+rustpython-vm = { git = "https://github.com/RustPython/RustPython.git", rev = "2a09ee02bd16dbe4405e1476efe92f7e59de94f7" }
+rustpython-stdlib = { git = "https://github.com/RustPython/RustPython.git", rev = "2a09ee02bd16dbe4405e1476efe92f7e59de94f7" }
+rustpython-pylib = { git = "https://github.com/RustPython/RustPython.git", rev = "2a09ee02bd16dbe4405e1476efe92f7e59de94f7" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "2a09ee02bd16dbe4405e1476efe92f7e59de94f7" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "2a09ee02bd16dbe4405e1476efe92f7e59de94f7" }

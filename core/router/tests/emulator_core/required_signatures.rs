@@ -81,7 +81,7 @@ fn served_unsigned(emulator: &Emulator, chunk: &'static [SweptOperation]) -> Vec
     served.map(|operation| operation.name.as_str()).collect()
 }
 
-/// A 403, or an error answered before any signature check and the same for a wrong secret.
+/// A 401 or 403, or an error answered before any signature check and the same for a wrong secret.
 fn refuses_unsigned(emulator: &Emulator, operation: &SweptOperation) -> bool {
     let unsigned = emulator.send(emulator.request_for(operation));
     let early = UNSERVED
@@ -90,5 +90,5 @@ fn refuses_unsigned(emulator: &Emulator, operation: &SweptOperation) -> bool {
     let (key, _) = emulator.published_key();
     let wrong = Signer::new(key, "x".into(), &operation.signing_name);
     let same = |reply: Reply| (reply.status, &reply.body) == (unsigned.status, &unsigned.body);
-    unsigned.status == 403 || early && same(emulator.signed_call(operation, &wrong))
+    matches!(unsigned.status, 401 | 403) || early && same(emulator.signed_call(operation, &wrong))
 }

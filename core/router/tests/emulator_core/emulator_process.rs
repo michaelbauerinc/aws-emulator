@@ -36,12 +36,15 @@ impl Emulator {
 
     /// [`Emulator::start`] in `home`, which an earlier, stopped start may have used.
     pub fn start_in(args: &[&str], home: PathBuf) -> Self {
+        // A forced stop can leave an earlier port's published files in this home.
+        // Snapshot public certificates before spawning, including for same-port restarts.
+        let previous_certificates = published_certificates(&home, 4);
         let mut started = Self::spawn(args, home, &[]);
         let folder = wait_until(STARTUP_TIMEOUT, || {
             if let Some(status) = started.child.try_wait().unwrap() {
                 panic!("the emulator exited with {status}:\n{}", started.log());
             }
-            folder_publishing_config(&started.home, 4)
+            folder_publishing_config(&started.home, 4, &previous_certificates)
         });
         started.folder = folder.unwrap_or_else(|| panic!("no files:\n{}", started.log()));
         let port = started.folder.file_name().and_then(|name| name.to_str());
@@ -90,11 +93,22 @@ impl Emulator {
         (value("aws_access_key_id"), value("aws_secret_access_key"))
     }
 
-    /// Only `PATH` comes from the test's environment, so nothing set for the test changes the run.
+    /// Inherit only PATH and Windows system-directory names; isolate the emulator's
+    /// profile and temporary files from the test runner's account configuration.
     fn spawn(args: &[&str], home: PathBuf, env: &[(&str, &str)]) -> Self {
         let log = std::fs::File::create(home.join(LOG_FILE)).unwrap();
         let mut command = Command::new(emulator_binary());
-        command.env_clear().env("HOME", &home);
+        command.env_clear();
+        #[cfg(not(windows))]
+        command.env("HOME", &home);
+        #[cfg(windows)]
+        {
+            command.env("USERPROFILE", &home);
+            command.env("TEMP", &home).env("TMP", &home);
+            for name in ["SystemRoot", "WINDIR"] {
+                command.envs(std::env::var_os(name).map(|value| (name, value)));
+            }
+        }
         command.envs(std::env::var_os("PATH").map(|path| ("PATH", path)));
         command.env("EMULATOR_TELEMETRY", "off");
         command.envs(env.iter().copied()).stdin(Stdio::null());
@@ -162,15 +176,49 @@ fn wait_until<T>(timeout: Duration, mut ready: impl FnMut() -> Option<T>) -> Opt
     }
 }
 
-/// The folder under `folder` holding a fully written `config`, published last, and not a link.
-fn folder_publishing_config(folder: &Path, depth_left: usize) -> Option<PathBuf> {
+/// Public certificates already present before a new child starts; never follow links.
+fn published_certificates(folder: &Path, depth_left: usize) -> Vec<Vec<u8>> {
+    let mut certificates: Vec<_> = published_certificate(folder).into_iter().collect();
+    if depth_left > 0 {
+        if let Ok(entries) = std::fs::read_dir(folder) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    certificates.extend(published_certificates(&entry.path(), depth_left - 1));
+                }
+            }
+        }
+    }
+    certificates
+}
+
+fn published_certificate(folder: &Path) -> Option<Vec<u8>> {
+    let path = folder.join("ca.pem");
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// The folder holding a complete config and a certificate absent before this child started.
+/// A reused certificate still fails startup; it is never accepted as a fresh publication.
+fn folder_publishing_config(
+    folder: &Path,
+    depth_left: usize,
+    previous_certificates: &[Vec<u8>],
+) -> Option<PathBuf> {
     let config = folder.join("config");
     let is_file = std::fs::symlink_metadata(&config).is_ok_and(|file| file.is_file());
-    if is_file && std::fs::read_to_string(config).is_ok_and(|text| text.ends_with('\n')) {
+    if is_file
+        && std::fs::read_to_string(config).is_ok_and(|text| text.ends_with('\n'))
+        && published_certificate(folder).is_some_and(|ca| !previous_certificates.contains(&ca))
+    {
         return Some(folder.to_path_buf());
     }
     let entries = std::fs::read_dir(folder).ok().filter(|_| depth_left > 0)?;
     let is_folder = |entry: &std::fs::DirEntry| entry.file_type().is_ok_and(|kind| kind.is_dir());
     let mut folders = entries.flatten().filter(is_folder);
-    folders.find_map(|entry| folder_publishing_config(&entry.path(), depth_left - 1))
+    folders.find_map(|entry| {
+        folder_publishing_config(&entry.path(), depth_left - 1, previous_certificates)
+    })
 }

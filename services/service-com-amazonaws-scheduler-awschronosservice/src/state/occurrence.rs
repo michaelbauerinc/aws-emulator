@@ -114,14 +114,16 @@ impl Occurrences {
         match self {
             Self::Once(at) => (*at >= from).then_some(*at),
             Self::Rate(_) => Some(from),
-            Self::Cron(..) => {
-                // The shared grammar's own iterator is strictly after its argument,
-                // so an instant exactly AT the floor is admitted by probing from the
-                // tick before it.
-                let probe = from
-                    .checked_sub(Duration::from_nanos(1))
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                self.next_after(probe)
+            Self::Cron(schedule, zone) => {
+                // The iterator is strictly after its argument. Subtract in chrono so
+                // the tick before the floor survives SystemTime's coarser precision.
+                let probe = ::chrono::DateTime::<::chrono::Utc>::from(from)
+                    .checked_sub_signed(::chrono::TimeDelta::nanoseconds(1))?
+                    .with_timezone(zone);
+                schedule
+                    .after(&probe)
+                    .next()
+                    .map(|instant| SystemTime::from(instant.with_timezone(&::chrono::Utc)))
             }
         }
     }

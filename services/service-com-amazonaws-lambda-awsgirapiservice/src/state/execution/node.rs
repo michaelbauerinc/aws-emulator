@@ -65,7 +65,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use rquickjs::function::Func;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
@@ -474,24 +474,31 @@ fn install_host(
         .map_err(|error| format!("the compiler could not be installed: {error}"))?;
     // Where the INIT phase ends and the handler's own run begins. The runtime calls this
     // once it has loaded the handler's module and resolved its entry point — which is
-    // everything the function's `Timeout` does not bound — and the deadline it answers is
-    // the instant that `Timeout` is up at, which is what the handler is told it has left.
+    // everything the function's `Timeout` does not bound.
     // It is ONE-SHOT ([`Bounds::start`]), and the runtime takes it off the globals with the
     // rest of this surface before a line of the package is loaded.
     let phase_bounds = Arc::clone(bounds);
     globals
         .set(
             "__hostBeginInvocation",
+            Func::from(move || phase_bounds.start()),
+        )
+        .map_err(|error| format!("the invoke phase could not be installed: {error}"))?;
+    // Report time left against the same clock that enforces the deadline. The host and
+    // JavaScript wall clocks can differ, so subtracting one from the other is not a bound.
+    let remaining_bounds = Arc::clone(bounds);
+    globals
+        .set(
+            "__hostRemainingTimeInMillis",
             Func::from(move || {
-                // Milliseconds since the epoch as a NUMBER, which is how JavaScript states
-                // an instant: the value is far inside the integers a double holds exactly.
+                // A Lambda timeout in whole milliseconds fits exactly in a JavaScript NUMBER.
                 #[allow(clippy::cast_precision_loss)]
                 {
-                    phase_bounds.start() as f64
+                    remaining_bounds.remaining().as_millis() as f64
                 }
             }),
         )
-        .map_err(|error| format!("the invoke phase could not be installed: {error}"))?;
+        .map_err(|error| format!("the remaining time could not be installed: {error}"))?;
     // The three pure computations the `crypto` core module is served by. They reach no
     // host path, socket or environment: an algorithm name and hex bytes go in, hex bytes
     // come out ([`digest`]).
@@ -973,9 +980,6 @@ pub struct Bounds {
     /// The clock every deadline of this run is read against, which the HOST hands the run
     /// ([`run_against`]) and no guest code can reach.
     clock: Clock,
-    /// When the HANDLER's run must be over, in milliseconds since the epoch, which is what
-    /// the handler is told it has left. Set by [`Self::start`].
-    deadline_epoch_ms: ::std::sync::atomic::AtomicI64,
     /// Whether the INVOKE phase has begun ([`Self::start`]).
     spending: AtomicBool,
     /// How many engine checks are left.
@@ -1003,7 +1007,6 @@ impl Bounds {
             ),
             wall_clock: budget.wall_clock,
             clock,
-            deadline_epoch_ms: ::std::sync::atomic::AtomicI64::new(0),
             spending: AtomicBool::new(false),
             checks: AtomicU64::new(MAX_ENGINE_CHECKS),
             response_bytes: budget.response_bytes,
@@ -1015,24 +1018,16 @@ impl Bounds {
     /// Begin the INVOKE phase: the handler's deadline runs from HERE, so what the bounds
     /// measure is the handler's own work rather than the execution environment this
     /// emulator built to run it in — the engine, the runtime and the load of the handler's
-    /// own module, none of which the function's `Timeout` bounds. Answers when that
-    /// deadline falls, in milliseconds since the epoch, which is what the handler is told
-    /// it has left.
+    /// own module, none of which the function's `Timeout` bounds.
     ///
-    /// ONE-SHOT: the invoke phase of a run begins once. A second call answers the same
-    /// deadline and moves nothing, so reaching this again cannot extend a deadline that is
-    /// already running.
-    fn start(&self) -> i64 {
+    /// ONE-SHOT: the invoke phase of a run begins once. A second call moves nothing, so
+    /// reaching this again cannot extend a deadline that is already running.
+    fn start(&self) {
         if self.spending.swap(true, Ordering::SeqCst) {
-            return self.deadline_epoch_ms.load(Ordering::Relaxed);
+            return;
         }
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
             self.clock.now() + self.wall_clock;
-        // What the handler is TOLD it has left is a host wall-clock instant rather than a
-        // bound: the bound is the deadline above, which this run's own clock is read for.
-        let epoch_ms = super::epoch_millis(SystemTime::now() + self.wall_clock);
-        self.deadline_epoch_ms.store(epoch_ms, Ordering::Relaxed);
-        epoch_ms
     }
 
     /// When the run must be over.

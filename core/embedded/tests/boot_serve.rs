@@ -1,45 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Boot check: the in-process facade assembles a connector.
-//!
-//! Keep this as an integration test under `embedded/tests/`, so `cargo test`
-//! exercises the facade a host actually links. [`AwsEmulatorEmbedded::http_client`]
-//! builds the whole router internally, so this proves the in-process entry point
-//! assembles with no socket bind.
-//!
-//! # Assemble on an explicitly sized thread
-//!
-//! Build the facade on a thread created with [`BOOT_STACK_SIZE`]: `http_client`
-//! builds the full router, and running it on the default cargo-test thread stack
-//! overflows and aborts once the workspace carries one large service.
-use aws_emulator_embedded::AwsEmulatorEmbedded;
+//! The public in-process facade assembles and executes a deployed Python function.
 
-/// Stack for assembling the facade here. Keep this at or above the size the
-/// router's own boot check uses, so a workspace that boots in production also
-/// passes here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
-
-/// An AWS SDK config builder's `http_client(..)` accepts only an `HttpClient`, so the
-/// facade must stay one: this stops compiling if `http_client()` no longer returns it.
-fn assert_sdk_http_client(_client: impl aws_smithy_runtime_api::client::http::HttpClient) {}
+mod common;
 
 #[test]
-fn the_in_process_facade_assembles() {
-    std::thread::Builder::new()
-        .name("boot-check".to_string())
-        .stack_size(BOOT_STACK_SIZE)
-        .spawn(|| {
-            let emulator = AwsEmulatorEmbedded::default();
-            assert_sdk_http_client(emulator.http_client());
-            assert!(
-                emulator
-                    .certificate_authority()
-                    .pem()
-                    .starts_with("-----BEGIN CERTIFICATE-----"),
-                "the facade must hand a host the certificate its listeners present"
-            );
-        })
-        .expect("spawn the boot-check thread")
-        .join()
-        .expect("the in-process facade must assemble a connector");
+fn the_in_process_facade_assembles_and_executes_python() {
+    let invoked = common::invoke_python();
+    let payload = common::response_json(&invoked);
+    assert_eq!(invoked.status().as_u16(), 200, "{payload}");
+    assert!(
+        !invoked.headers().contains_key("x-amz-function-error"),
+        "Python must run successfully in this embedding host: {payload}"
+    );
+    assert_eq!(payload, serde_json::json!({ "total": 10 }));
 }
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR: aws_emulator_embedded::WindowsLambdaAllocator<std::alloc::System> =
+    aws_emulator_embedded::WindowsLambdaAllocator::new(std::alloc::System);

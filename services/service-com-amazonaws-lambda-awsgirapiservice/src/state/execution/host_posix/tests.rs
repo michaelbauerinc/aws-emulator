@@ -92,6 +92,17 @@ fn returned(finished: &Finished, case: &str) -> ::serde_json::Value {
 /// `os` presents is a property of the runtime and not of any of those.
 #[test]
 fn a_module_built_out_of_the_standard_library_imports_and_runs() {
+    // Windows supplies Linux guest flags; other builds preserve their host C-library
+    // values. Check combinations computed by guest Python against that contract.
+    #[cfg(windows)]
+    let (create_and_truncate, append_without_blocking, sync_includes_dsync) =
+        (0o1101, 0o6000, true);
+    #[cfg(not(windows))]
+    let (create_and_truncate, append_without_blocking, sync_includes_dsync) = (
+        ::libc::O_WRONLY | ::libc::O_CREAT | ::libc::O_TRUNC,
+        ::libc::O_APPEND | ::libc::O_NONBLOCK,
+        ::libc::O_SYNC & ::libc::O_DSYNC == ::libc::O_DSYNC,
+    );
     // The case, the module source, and the members the answer must carry.
     let rows: &[(&str, &str, ::serde_json::Value)] = &[
         (
@@ -142,10 +153,9 @@ fn a_module_built_out_of_the_standard_library_imports_and_runs() {
             // `glob` combines `os.O_RDONLY` with the directory flag as it is imported, which
             // is what reaches the open-flag and access-mode DATA.
             //
-            // Source of the expected numbers: POSIX fixes the access modes and the three
-            // open modes, so those are asserted as the numbers they are; the remaining open
-            // flags are the platform's own bits, read from its C headers, so what the row
-            // asserts of them is that each is one distinct bit rather than a placeholder.
+            // Combining flags checks the Windows Linux values and preserves the host
+            // values on existing non-Windows builds. The remaining checks catch missing
+            // or placeholder flags.
             "a module that imports glob, which combines the open flags",
             "import glob\n\
              import os\n\
@@ -157,6 +167,9 @@ fn a_module_built_out_of_the_standard_library_imports_and_runs() {
                          'read_write': os.O_RDWR,\n            \
                          'access': [os.F_OK, os.X_OK, os.W_OK, os.R_OK],\n            \
                          'seek': [os.SEEK_SET, os.SEEK_CUR, os.SEEK_END],\n            \
+                         'create_and_truncate': os.O_WRONLY | os.O_CREAT | os.O_TRUNC,\n            \
+                         'append_without_blocking': os.O_APPEND | os.O_NONBLOCK,\n            \
+                         'sync_includes_dsync': os.O_SYNC & os.O_DSYNC == os.O_DSYNC,\n            \
                          'distinct_bits': len(set(flags)) == len(flags),\n            \
                          'single_bits': [f for f in flags if f <= 0 or f & (f - 1)],\n            \
                          'has_escape': hasattr(glob, 'escape')}\n",
@@ -166,6 +179,9 @@ fn a_module_built_out_of_the_standard_library_imports_and_runs() {
                 "read_write": 2,
                 "access": [0, 1, 2, 4],
                 "seek": [0, 1, 2],
+                "create_and_truncate": create_and_truncate,
+                "append_without_blocking": append_without_blocking,
+                "sync_includes_dsync": sync_includes_dsync,
                 "distinct_bits": true,
                 "single_bits": [],
                 "has_escape": true,

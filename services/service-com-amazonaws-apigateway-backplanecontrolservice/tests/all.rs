@@ -592,3 +592,10 @@ mod stage_authorizer_deny_blocks_the_backend;
 // document class that refused the call.
 #[path = "all/stage_invoke_denial_sentence.rs"]
 mod stage_invoke_denial_sentence;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

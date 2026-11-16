@@ -475,5 +475,8 @@ aws-credential-types = { workspace = true }
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+aws-emulator-windows-support = { path = "../../platform/windows-support", features = ["allocation"] }
+
 [lints]
 workspace = true

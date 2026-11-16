@@ -1753,3 +1753,9 @@ mod apigateway_vpc_link_private_integration;
 // single service crate's test target can drive it.
 #[path = "all/cognito_signed_session_leading_keys_partition.rs"]
 mod cognito_signed_session_leading_keys_partition;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR: aws_emulator_windows_support::allocation::ObservedAllocator<std::alloc::System> =
+    aws_emulator_windows_support::allocation::ObservedAllocator::new(std::alloc::System);

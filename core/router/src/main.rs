@@ -28,6 +28,12 @@
 //! This file is framework code, emitted ONCE — the scaffold does not re-render
 //! it. Do not edit it. (`router/src/lib.rs` IS re-rendered on every service add.)
 
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR: aws_emulator_windows_support::allocation::ObservedAllocator<std::alloc::System> =
+    aws_emulator_windows_support::allocation::ObservedAllocator::new(std::alloc::System);
+
 use emulator_server::cli::{BuildInfo, Command, RunOptions};
 use engine::InMemoryEngine;
 use std::io::Write;

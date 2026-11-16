@@ -275,3 +275,10 @@ mod vended_log_delivery_clock;
 mod vended_log_event_members;
 #[path = "all/zz_scratch.rs"]
 mod zz_scratch;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

@@ -16,7 +16,7 @@ use std::time::Duration;
 pub struct Budget {
     /// How long the handler may run for.
     pub wall_clock: Duration,
-    /// How many traced events the handler may execute.
+    /// How many execution checkpoints the handler may spend.
     pub steps: u64,
     /// How much memory the run may add to this process.
     pub memory_bytes: u64,
@@ -33,7 +33,7 @@ pub struct Budget {
 pub enum Stop {
     /// The run outlasted its wall clock.
     Deadline,
-    /// The run executed more traced events than its budget.
+    /// The run exceeded its execution checkpoint budget.
     Steps,
     /// The run grew this process past its ceiling.
     Memory,

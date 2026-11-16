@@ -177,3 +177,10 @@ mod update_extension_visibility;
 mod validate_configuration_resource_resolution;
 #[path = "all/validate_configuration_verdict.rs"]
 mod validate_configuration_verdict;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

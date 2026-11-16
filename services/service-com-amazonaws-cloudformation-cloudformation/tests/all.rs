@@ -611,3 +611,10 @@ mod ssm_parameter_types;
 mod mwaa_environment_resource_type;
 #[path = "all/dynamodb_table_creation_window.rs"]
 mod dynamodb_table_creation_window;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

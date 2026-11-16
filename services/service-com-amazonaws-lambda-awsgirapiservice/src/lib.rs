@@ -16,6 +16,20 @@ pub use state::ComAmazonawsLambdaAwsgirapiserviceState;
 
 pub use service::EmulatedService;
 
+/// Windows allocator wrapper for applications that execute Python through this crate.
+///
+/// Install it once in the application's executable, around its chosen allocator:
+/// ```ignore
+/// #[global_allocator]
+/// static ALLOCATOR:
+///     service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+///     service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);
+/// ```
+/// This library leaves allocator selection to its host. Python execution on Windows
+/// refuses to start when the application has not installed the ownership observer.
+#[cfg(windows)]
+pub use aws_emulator_windows_support::allocation::ObservedAllocator as WindowsLambdaAllocator;
+
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-lambda-awsgirapiservice.json");
 
 include!(concat!(env!("OUT_DIR"), "/com_amazonaws_lambda_awsgirapiservice_service_decl.rs"));

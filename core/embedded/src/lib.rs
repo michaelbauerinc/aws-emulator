@@ -15,6 +15,19 @@
 //! Each emulator owns a FRESH engine: clients from one emulator share state, and two
 //! emulators never do.
 
+/// Windows host allocator wrapper required for Python Lambda memory accounting.
+///
+/// Install it once in the embedding executable, around its chosen allocator:
+/// ```ignore
+/// #[global_allocator]
+/// static ALLOCATOR: aws_emulator_embedded::WindowsLambdaAllocator<std::alloc::System> =
+///     aws_emulator_embedded::WindowsLambdaAllocator::new(std::alloc::System);
+/// ```
+/// This crate does not select a global allocator. Python execution on Windows
+/// refuses to start if its application has not installed the observer.
+#[cfg(windows)]
+pub use aws_emulator_windows_support::allocation::ObservedAllocator as WindowsLambdaAllocator;
+
 pub use emulator_server::embedded::{Authentication, EmbeddedOptions, Telemetry};
 pub use emulator_server::{TlsCertificateAuthority, VendedCredentials};
 use emulator_telemetry::{TelemetryClient, TelemetryOptions};

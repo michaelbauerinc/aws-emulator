@@ -388,6 +388,9 @@ fn settling(engine: &Arc<engine::InMemoryEngine>, record: Record) -> (Settling, 
     )
 }
 
+// Windows SystemTime arithmetic truncates to 100 ns intervals.
+const SYSTEM_TIME_TICK: Duration = Duration::from_nanos(if cfg!(windows) { 100 } else { 1 });
+
 /// Where a case takes the clock, relative to the record's own due instant.
 #[derive(Debug, Clone, Copy)]
 enum Clock {
@@ -399,11 +402,17 @@ enum Clock {
 impl Clock {
     /// The instant this case settles the record at.
     fn instant(self, due: SystemTime) -> SystemTime {
-        match self {
+        let at = match self {
             Clock::Before(by) => due - by,
             Clock::At => due,
             Clock::After(by) => due + by,
+        };
+        match self {
+            Clock::Before(_) => assert!(at < due, "before-due fixture must be strictly earlier"),
+            Clock::At => {}
+            Clock::After(_) => assert!(at > due, "after-due fixture must be strictly later"),
         }
+        at
     }
 }
 
@@ -438,7 +447,7 @@ async fn a_write_records_a_due_instant_a_whole_span_out() {
 /// status the clock owes.
 ///
 /// The rows differ along the kind of record and how far from the due instant the clock is
-/// taken, down to the single nanosecond either side of it.
+/// taken, down to one representable SystemTime tick either side of it.
 #[tokio::test]
 async fn the_owed_status_falls_due_at_the_due_instant_and_not_before() {
     // (case, where the clock is taken, whether the owed status is reported there)
@@ -446,9 +455,9 @@ async fn the_owed_status_falls_due_at_the_due_instant_and_not_before() {
         ("an hour before the due instant", Clock::Before(Duration::from_secs(3_600)), false),
         ("a second before it", Clock::Before(Duration::from_secs(1)), false),
         ("a millisecond before it", Clock::Before(Duration::from_millis(1)), false),
-        ("a nanosecond before it", Clock::Before(Duration::from_nanos(1)), false),
+        ("one clock tick before it", Clock::Before(SYSTEM_TIME_TICK), false),
         ("exactly at it", Clock::At, true),
-        ("a nanosecond after it", Clock::After(Duration::from_nanos(1)), true),
+        ("one clock tick after it", Clock::After(SYSTEM_TIME_TICK), true),
         ("an hour after it", Clock::After(Duration::from_secs(3_600)), true),
     ];
 

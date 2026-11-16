@@ -22,6 +22,7 @@ aws agent-toolkit add-skill --skill-name aws-emulator --region us-east-1
 
 - **Linux:** install the RPM or Debian package and run `aws-emulator`. See [Getting started on Linux](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-linux.html).
 - **Windows / macOS:** run the emulator in a container built from a short Dockerfile. See [Getting started with Docker](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-docker.html).
+- **Native Windows (experimental):** see [Building on Windows](WINDOWS.md).
 
 Point your SDK at a running emulator by setting environment variables. See [Pointing your AWS SDK at AWS Emulator](https://docs.aws.amazon.com/emulator/latest/userguide/point-sdk-to-emulator.html).
 
@@ -37,11 +38,11 @@ Individual gaps are tracked in the repository's `issues/` directory. APIs and be
 
 ## Building from source
 
-You need this if you are modifying the emulator, running it from a checkout, or using embedded mode. Embedded mode compiles the emulator into your test binary, so the prerequisites and build-cost guidance below apply to it too. Most other users install a prebuilt package instead (see [Quick start](#quick-start)). Building from source is supported on **Linux (x86_64 and aarch64)**; on Windows and macOS, use the Docker path above.
+You need this if you are modifying the emulator, running it from a checkout, or using embedded mode. Embedded mode compiles the emulator into your test binary, so the prerequisites and build-cost guidance below apply to it too. Most other users install a prebuilt package instead (see [Quick start](#quick-start)). Building from source is supported on **Linux (x86_64 and aarch64)**. Experimental native Windows x64 build instructions are in [WINDOWS.md](WINDOWS.md); the Docker path above is also available on Windows and macOS.
 
 ### Prerequisites
 
-- A Rust toolchain with Cargo (install via [rustup](https://rustup.rs)).
+- Rust 1.99.0 or later with Cargo (install via [rustup](https://rustup.rs)).
 - A C compiler, such as GCC or clang. Some dependencies build C code.
 - At least 100 GB of free disk for `target/`. The workspace has one crate per AWS service, so a debug build of everything is large, and it grows as services are added.
 - A multi-core machine. A cold full build compiles every service crate, so the first build takes a while; fewer cores take proportionally longer. After that, rebuilding after a change to one service is much faster.
@@ -137,4 +138,4 @@ Report bugs and fidelity gaps in [GitHub Issues](https://github.com/aws/aws-emul
 
 ## License
 
-This software is licensed under the CC0 1.0 Universal (CC0-1.0) License, except the code in the `vendor/` directory, which is under the Apache License 2.0. See [LICENSE](LICENSE) for details, and [vendor/README.md](vendor/README.md) for the license of the code in `vendor/`.
+This software is licensed under the CC0 1.0 Universal (CC0-1.0) License, except the framework in `vendor/` (Apache License 2.0) and the Windows [CSV module](services/service-com-amazonaws-lambda-awsgirapiservice/src/state/execution/host_csv.rs) derived from RustPython (MIT). See [LICENSE](LICENSE), [vendor/README.md](vendor/README.md), and the CSV source header for the corresponding notices.

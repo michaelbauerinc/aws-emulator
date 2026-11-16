@@ -189,6 +189,10 @@ pub fn layer_archives(layers: &[super::FunctionLayer]) -> Vec<Arc<Vec<u8>>> {
 /// in it.
 mod host_posix;
 
+/// Windows CSV state belongs to each Python environment.
+#[cfg(windows)]
+mod host_csv;
+
 /// Whether the key a function's environment variables are encrypted with can decrypt them
 /// — the check every invocation of such a function begins with.
 pub mod environment_key;
@@ -341,8 +345,8 @@ pub fn mint_request_id() -> String {
     ::uuid::Uuid::new_v4().to_string()
 }
 
-/// How many traced events one run may execute. Large enough for any handler a test or a
-/// client runs, small enough that a loop with no exit ends inside the caller's wait.
+/// How many execution checkpoints one run may spend, bounding a loop independently
+/// of its wall-clock timeout.
 const MAX_RUN_STEPS: u64 = 20_000_000;
 
 /// How much memory one run may add to this process.
@@ -1966,3 +1970,10 @@ mod tests {
         );
     }
 }
+
+// The Windows Python runtime observes Rust allocations at the application boundary.
+// Libraries expose the wrapper but leave global-allocator selection to their host.
+#[cfg(all(windows, test))]
+#[global_allocator]
+static WINDOWS_ALLOCATOR: aws_emulator_windows_support::allocation::ObservedAllocator<std::alloc::System> =
+    aws_emulator_windows_support::allocation::ObservedAllocator::new(std::alloc::System);

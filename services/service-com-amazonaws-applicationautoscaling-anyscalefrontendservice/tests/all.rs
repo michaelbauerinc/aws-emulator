@@ -101,3 +101,10 @@ mod target_tracking_alarms;
 mod target_tracking_execution;
 #[path = "all/unregistered_target_refusals.rs"]
 mod unregistered_target_refusals;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

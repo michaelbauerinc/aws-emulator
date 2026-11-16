@@ -224,3 +224,10 @@ mod recorded_item_status_and_resumed_recording;
 // module name to match the file name.
 #[path = "all/scratch_resume.rs"]
 mod scratch_resume;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

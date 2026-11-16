@@ -74,6 +74,8 @@ struct TimingRow {
     /// expression it wrote — never read back off the emulator.
     expression: fn() -> (String, SystemTime),
     timezone: Option<&'static str>,
+    /// Whether `StartDate` is the occurrence's own instant.
+    start_at_occurrence: bool,
     /// `MaximumWindowInMinutes` under `Mode=FLEXIBLE`, or `None` for `Mode=OFF`.
     window_minutes: Option<i64>,
 }
@@ -123,6 +125,7 @@ const TIMING_ROWS: &[TimingRow] = &[
             (format!("at({})", at_expression_body(at)), at)
         },
         timezone: Some("UTC"),
+        start_at_occurrence: false,
         window_minutes: None,
     },
     TimingRow {
@@ -135,6 +138,7 @@ const TIMING_ROWS: &[TimingRow] = &[
             )
         },
         timezone: Some("Asia/Kolkata"),
+        start_at_occurrence: false,
         window_minutes: None,
     },
     TimingRow {
@@ -144,6 +148,17 @@ const TIMING_ROWS: &[TimingRow] = &[
             (cron_pinned_to(at), at)
         },
         timezone: None,
+        start_at_occurrence: false,
+        window_minutes: None,
+    },
+    TimingRow {
+        case: "a cron occurrence exactly at its StartDate",
+        expression: || {
+            let at = next_minute_boundary(15);
+            (cron_pinned_to(at), at)
+        },
+        timezone: None,
+        start_at_occurrence: true,
         window_minutes: None,
     },
     TimingRow {
@@ -153,6 +168,7 @@ const TIMING_ROWS: &[TimingRow] = &[
             (format!("at({})", at_expression_body(at)), at)
         },
         timezone: None,
+        start_at_occurrence: false,
         window_minutes: Some(1),
     },
 ];
@@ -255,6 +271,9 @@ async fn no_occurrence_is_invoked_before_the_instant_its_expression_names() {
         });
         if let Some(timezone) = row.timezone {
             body["ScheduleExpressionTimezone"] = json!(timezone);
+        }
+        if row.start_at_occurrence {
+            body["StartDate"] = json!(epoch_seconds(nominal));
         }
         given_schedule(&emulator, case, &format!("timing-{index}"), body).await;
 

@@ -2665,16 +2665,20 @@ mod tests {
 
     /// A JVM with no TLS code reaches the production listener once
     /// `JAVA_TOOL_OPTIONS` names the published `truststore.p12`, and fails the
-    /// handshake without it. Skipped when no `JAVA_HOME/bin/java` is present.
+    /// handshake without it. Skipped when JAVA_HOME has no Java launcher.
     /// Multi-threaded because the JVM runs as a blocking child process while the
     /// server task must keep answering it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_jvm_trusts_the_emulator_through_the_published_truststore() {
         let Some(java) = std::env::var_os("JAVA_HOME")
-            .map(|home| std::path::PathBuf::from(home).join("bin").join("java"))
+            .map(|home| {
+                std::path::PathBuf::from(home)
+                    .join("bin")
+                    .join(format!("java{}", std::env::consts::EXE_SUFFIX))
+            })
             .filter(|path| path.exists())
         else {
-            eprintln!("skipped: no JAVA_HOME/bin/java");
+            eprintln!("skipped: JAVA_HOME has no Java launcher");
             return;
         };
         // `java Health.java` (single-file source launch) needs JDK 11 or later.
@@ -2720,7 +2724,7 @@ mod tests {
         };
 
         let trusted = run(Some(format!(
-            "-Djavax.net.ssl.trustStore={} -Djavax.net.ssl.trustStoreType=PKCS12",
+            "-Djavax.net.ssl.trustStore=\"{}\" -Djavax.net.ssl.trustStoreType=PKCS12",
             store.display()
         )));
         let untrusted = run(None);

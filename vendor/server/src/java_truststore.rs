@@ -206,10 +206,14 @@ mod tests {
     #[test]
     fn keytool_lists_every_entry_as_trusted_without_a_password() {
         let keytool = std::env::var_os("JAVA_HOME")
-            .map(|home| std::path::PathBuf::from(home).join("bin").join("keytool"))
+            .map(|home| {
+                std::path::PathBuf::from(home)
+                    .join("bin")
+                    .join(format!("keytool{}", std::env::consts::EXE_SUFFIX))
+            })
             .filter(|path| path.exists());
         let Some(keytool) = keytool else {
-            eprintln!("skipped: no JAVA_HOME/bin/keytool");
+            eprintln!("skipped: JAVA_HOME has no keytool executable");
             return;
         };
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();

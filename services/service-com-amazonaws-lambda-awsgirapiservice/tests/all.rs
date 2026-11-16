@@ -510,3 +510,9 @@ mod zzprobe;
 // name belongs to, and check it is not declared already before appending it here.
 // `function_url_reported_members` was appended here and now stands in the sorted span above,
 // where its name belongs, so nothing is declared twice.
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR: aws_emulator_windows_support::allocation::ObservedAllocator<std::alloc::System> =
+    aws_emulator_windows_support::allocation::ObservedAllocator::new(std::alloc::System);

@@ -598,13 +598,13 @@ fn within_clock_skew(amz_date: &str) -> bool {
 }
 
 /// Writes `keys` to `<emulator home>/<port>/emulator_credentials` (AWS shared credentials format,
-/// owner-only); the file is removed when the returned guard drops. Refused where the file cannot be
-/// made owner-only (non-Unix), rather than leaving the secret readable by other users.
+/// owner-only). The returned guard attempts to remove the file when dropped. Refused where the file
+/// cannot be made owner-only, rather than leaving the secret readable by other users.
 pub fn write_credentials_file(
     keys: &SigV4Authenticator,
     port: u16,
 ) -> std::io::Result<EmulatorFile> {
-    if cfg!(not(unix)) {
+    if cfg!(not(any(unix, windows))) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "the credentials file cannot be made owner-only on this platform",
@@ -615,8 +615,9 @@ pub fn write_credentials_file(
     write_emulator_file(port, "emulator_credentials", &text)
 }
 
-/// Writes `text` to `<emulator home>/<port>/<name>`, owner-only on Unix, replacing (never
-/// following) whatever is already there; the file is removed when the returned guard drops.
+/// Writes `text` to `<emulator home>/<port>/<name>`, owner-only on Unix and Windows.
+/// Existing entries are never followed; Windows refuses reparse points and hard links.
+/// Cleanup is best-effort: an open Windows client handle can prevent deletion when the guard drops.
 pub fn write_emulator_file(port: u16, name: &str, text: &str) -> std::io::Result<EmulatorFile> {
     write_emulator_bytes(port, name, text.as_bytes())
 }
@@ -625,24 +626,39 @@ pub fn write_emulator_file(port: u16, name: &str, text: &str) -> std::io::Result
 pub fn write_emulator_bytes(port: u16, name: &str, bytes: &[u8]) -> std::io::Result<EmulatorFile> {
     let home = emulator_paths::emulator_home().ok_or(std::io::ErrorKind::NotFound)?;
     let folder = home.join(port.to_string());
-    std::fs::create_dir_all(&folder)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&folder, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-    let path = folder.join(name);
-    match std::fs::remove_file(&path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-        _ => {}
+    #[cfg(windows)]
+    {
+        return aws_emulator_windows_support::credentials::write_private_file(&folder, name, bytes)
+            .map(|file| EmulatorFile(file.path().to_path_buf(), file));
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    std::io::Write::write_all(&mut options.open(&path)?, bytes)?;
-    Ok(EmulatorFile(path))
+    #[cfg(not(windows))]
+    {
+        std::fs::create_dir_all(&folder)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&folder, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        let path = folder.join(name);
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        std::io::Write::write_all(&mut options.open(&path)?, bytes)?;
+        Ok(EmulatorFile(path))
+    }
 }
 
-pub struct EmulatorFile(pub std::path::PathBuf);
+pub struct EmulatorFile(
+    pub std::path::PathBuf,
+    // Retains native directory locks and identity-checked cleanup until this guard drops.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    aws_emulator_windows_support::credentials::PrivateFile,
+);
 
+#[cfg(not(windows))]
 impl Drop for EmulatorFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);

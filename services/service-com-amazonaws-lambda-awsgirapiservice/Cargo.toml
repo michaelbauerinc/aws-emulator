@@ -150,14 +150,15 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 #   guest code, and the modules the guest does expect (`os`, `_thread`) are this crate's
 #   own replacements.
 # * `rustpython-ruff_*` are RustPython's own forks of the Python parser's AST crates.
-#   They are PINNED exactly: `rustpython-codegen` 0.6 is built against the 0.16.5 AST,
-#   and 0.16.10 renamed fields it uses, so an unpinned resolution picks a newer 0.16.x
-#   and fails to compile.
+#   Their exact versions match the upstream RustPython revision pinned by the workspace.
 # * `nix` (`resource` only) and `memory-stats` read this process's own resource usage —
 #   the run thread's faulted pages and the process resident size — which is how a run is
 #   bounded in memory: RustPython exposes no allocator seam, so the bound is sampled from
 #   outside the guest. `nix` is the only one of these that compiles no C; `memory-stats`
-#   reads `/proc/self/statm` on Linux.
+#   reads `/proc/self/statm` on Linux. Windows uses the executable's allocation
+#   observer from the small native support crate: phases measure per-environment
+#   peak live backing-byte growth. This is cooperative accounting, not a hard cap;
+#   see platform/windows-support/MEMORY_ACCOUNTING.md for the measured boundaries.
 #
 # Native and unsafe surface accepted here: the RustPython tree uses `unsafe` for its
 # object model and its frozen-module tables, and its `malachite`/`num` arithmetic
@@ -186,12 +187,11 @@ rustpython-vm = { version = "0.6", default-features = false, features = [
 ] }
 rustpython-stdlib = { version = "0.6", default-features = false }
 rustpython-pylib = { version = "0.6", features = ["freeze-stdlib"] }
-rustpython-ruff_python_ast = "=0.16.5"
-rustpython-ruff_python_parser = "=0.16.5"
-rustpython-ruff_python_trivia = "=0.16.5"
-rustpython-ruff_source_file = "=0.16.5"
-rustpython-ruff_text_size = "=0.16.5"
-nix = { version = "0.31", default-features = false, features = ["resource"] }
+rustpython-ruff_python_ast = "=0.16.10"
+rustpython-ruff_python_parser = "=0.16.10"
+rustpython-ruff_python_trivia = "=0.16.10"
+rustpython-ruff_source_file = "=0.16.10"
+rustpython-ruff_text_size = "=0.16.10"
 memory-stats = "1"
 # The TRAFFIC SPLIT an alias with a `RoutingConfig` performs: one uniform draw per
 # invocation decides which of the two versions that invocation runs on
@@ -217,10 +217,20 @@ percent-encoding = "2.3"
 # already in this workspace's lock file.
 aws-sigv4 = { version = "1", default-features = false, features = ["http1", "sign-http"] }
 aws-credential-types = "1"
-# The platform's own values for the names a complete POSIX module carries as plain data —
-# the `open` flags the standard library reads off `os` while being imported
-# (`state::execution::host_posix`) — taken from the C headers rather than written out here.
+
+[target.'cfg(not(windows))'.dependencies]
+# Preserve the host POSIX constants used by existing non-Windows builds.
 libc = "0.2"
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["resource"] }
+
+[target.'cfg(windows)'.dependencies]
+# The Windows CSV module uses the same iterator and lock dependencies as upstream RustPython.
+itertools = { version = "0.15.0", default-features = false, features = ["use_alloc"] }
+parking_lot = "0.12.3"
+# Safe Windows resource accounting; no host API is exposed to guest Python.
+aws-emulator-windows-support = { path = "../../platform/windows-support", features = ["allocation"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

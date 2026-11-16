@@ -62,6 +62,31 @@ async fn calls_are_served_by_the_in_process_emulator() {
 
 ## Tests
 
-`tests/boot_serve.rs` is a boot check: it proves the facade assembles a connector
-with no socket bind. Behavioural tests belong in the service crate they exercise,
-where they run without rebuilding the rest of the workspace.
+`tests/boot_serve.rs` checks assembly and invokes a Python function through the
+public facade without binding a socket. On Windows, `tests/missing_allocator.rs`
+checks that a host without the allocation observer refuses Python execution.
+Broader service behavior is tested in the service crates.
+
+## Native Windows hosts
+
+Windows embedding hosts need the [Windows build prerequisites](../../WINDOWS.md).
+Cargo applies dependency patches and build profiles only from the invoking
+workspace root. External hosts must copy the RustPython overrides from
+`[patch.crates-io]` and the `[profile.dev.package.rustpython-vm]` setting in the
+emulator's [root manifest](../../Cargo.toml). The VM optimization also applies to
+test builds and avoids the unoptimized dispatch's large native stack frames.
+
+Each executable that invokes Python Lambda must wrap its global allocator:
+
+```rust
+#[cfg(windows)]
+#[global_allocator]
+static ALLOCATOR: aws_emulator_embedded::WindowsLambdaAllocator<std::alloc::System> =
+    aws_emulator_embedded::WindowsLambdaAllocator::new(std::alloc::System);
+```
+
+An application with its own allocator wraps that allocator instead of `System`.
+Libraries do not select an allocator for their host. Python refuses to start if
+the observer is absent or its accounting is unavailable. The observer measures
+owned Rust allocations cooperatively; it is not a hard resident-memory limit.
+See [memory accounting](../../platform/windows-support/MEMORY_ACCOUNTING.md).

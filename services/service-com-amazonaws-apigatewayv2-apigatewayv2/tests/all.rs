@@ -301,3 +301,10 @@ mod websocket_handshake_data_plane;
 mod websocket_lambda_routes;
 #[path = "all/websocket_transport_data_plane.rs"]
 mod websocket_transport_data_plane;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

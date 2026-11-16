@@ -192,6 +192,7 @@ mod tests;
 /// to. The standard library reads them off `os` while being imported (`glob` builds its
 /// directory-open flags out of `os.O_RDONLY`, `shutil` and the modules that import it read
 /// `os.F_OK`), which is why they are here at all.
+#[cfg(not(windows))]
 const POSIX_FLAGS: &[(&str, i32)] = &[
     // The modes an access check names.
     ("F_OK", ::libc::F_OK),
@@ -217,6 +218,56 @@ const POSIX_FLAGS: &[(&str, i32)] = &[
     ("SEEK_SET", ::libc::SEEK_SET),
     ("SEEK_CUR", ::libc::SEEK_CUR),
     ("SEEK_END", ::libc::SEEK_END),
+];
+
+/// The Windows port supplies Linux flags because Windows has no complete POSIX flag set.
+///
+/// The x86_64 and arm64 Linux ABIs agree on these values except for `O_DIRECTORY`
+/// and `O_NOFOLLOW`; the table uses the ABI matching this build's architecture.
+///
+/// Sources: Linux UAPI `include/uapi/asm-generic/fcntl.h` and
+/// `arch/arm64/include/uapi/asm/fcntl.h`. These are guest DATA only: the module above has
+/// no `open`, `access` or `lseek` that could pass them to the host's operating system.
+#[cfg(windows)]
+const POSIX_FLAGS: &[(&str, i32)] = &[
+    // The modes an access check names.
+    ("F_OK", 0),
+    ("R_OK", 4),
+    ("W_OK", 2),
+    ("X_OK", 1),
+    // The flags an open takes, in Linux's octal notation.
+    ("O_RDONLY", 0),
+    ("O_WRONLY", 1),
+    ("O_RDWR", 2),
+    ("O_APPEND", 0o2000),
+    ("O_CREAT", 0o100),
+    ("O_EXCL", 0o200),
+    ("O_TRUNC", 0o1000),
+    ("O_NONBLOCK", 0o4000),
+    ("O_NOCTTY", 0o400),
+    ("O_CLOEXEC", 0o2000000),
+    (
+        "O_DIRECTORY",
+        if cfg!(target_arch = "aarch64") {
+            0o40000
+        } else {
+            0o200000
+        },
+    ),
+    (
+        "O_NOFOLLOW",
+        if cfg!(target_arch = "aarch64") {
+            0o100000
+        } else {
+            0o400000
+        },
+    ),
+    ("O_SYNC", 0o4010000),
+    ("O_DSYNC", 0o10000),
+    // Where a seek counts from.
+    ("SEEK_SET", 0),
+    ("SEEK_CUR", 1),
+    ("SEEK_END", 2),
 ];
 
 /// The TYPE a POSIX `stat` answers with, which `os` re-exports as `os.stat_result`.

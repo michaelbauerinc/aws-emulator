@@ -16,8 +16,8 @@
 //! is bounded against a clock whose span this host's speed cannot spend: one that stands
 //! STILL ([`Clock::still`]), against which a deadline never falls, so only a bound that is
 //! not a span of time can answer the run; or one its own READINGS drive ([`Clock::driven`]),
-//! against which a deadline falls after a number of readings — the run's traced events and
-//! the host's own samples of it — rather than after a span of this host's time.
+//! against which a deadline falls after a number of readings — the run's execution
+//! checkpoints and the host's own samples of it — rather than a span of this host's time.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -71,8 +71,8 @@ impl Clock {
     /// A clock its own READINGS drive: each reading answers `tick` after the one before it.
     ///
     /// A span of such a clock is a NUMBER of readings rather than a span of this host's
-    /// time, so a deadline read against it falls after the run has delivered that many
-    /// traced events — the same number on an idle host and on a loaded one. For DRIVING a
+    /// time, so a deadline read against it falls after that many readings from execution
+    /// checkpoints and the host's watch, independent of this host's speed. For DRIVING a
     /// run, like [`Self::still`], and reached from no request path either.
     #[must_use]
     pub fn driven(tick: Duration) -> Self {

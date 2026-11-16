@@ -45,3 +45,10 @@ mod tagging_refusal_messages;
 mod universal_target_invocation;
 #[path = "all/wire_harness.rs"]
 mod wire_harness;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);

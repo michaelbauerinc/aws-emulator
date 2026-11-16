@@ -234,15 +234,32 @@ fn with_uri(mut parts: http::request::Parts, from: &str, to: &str) -> http::requ
 fn the_switch_is_off_by_default_and_the_credentials_file_is_private() {
     let home = std::env::temp_dir().join(format!("request-authentication-{}", std::process::id()));
     // SAFETY: no other test in this binary reads or writes these variables.
+    #[cfg(not(windows))]
     unsafe { std::env::set_var("HOME", &home) };
+    #[cfg(windows)]
+    unsafe { std::env::set_var("USERPROFILE", &home) };
     assert!(!authentication_enabled(), "off by default");
     for enabled in [true, false] {
         set_authentication(enabled);
         assert_eq!(authentication_enabled(), enabled);
     }
     let written = write_credentials_file(&emulator(), 4566);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     assert_eq!(written.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    #[cfg(windows)]
+    {
+        let file = written.unwrap();
+        assert_eq!(file.0, home.join(".emulator/4566/emulator_credentials"));
+        assert!(std::fs::read_to_string(&file.0).unwrap().contains(KEY));
+        let path = file.0.clone();
+        drop(file);
+        assert!(!path.exists());
+        let rewritten = write_credentials_file(&emulator(), 4566).unwrap();
+        let ca = write_emulator_file(4566, "ca.pem", "pem").unwrap();
+        assert_eq!(std::fs::read_to_string(&ca.0).unwrap(), "pem");
+        created_secrets_stay_off_disk(&home.join(".emulator/4566"));
+        drop((rewritten, ca));
+    }
     #[cfg(unix)]
     {
         let file = written.unwrap();

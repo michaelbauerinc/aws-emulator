@@ -12,5 +12,14 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 smithy-server-runtime = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["time"] }
+serde_json = { workspace = true }
+base64 = "0.22"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+aws-emulator-windows-support = { path = "../../platform/windows-support", features = ["allocation"] }
+
 [lints]
 workspace = true

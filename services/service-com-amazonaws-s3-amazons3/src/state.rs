@@ -3354,7 +3354,8 @@ fn midnight_after_days(from: SystemTime, days: i32) -> Option<SystemTime> {
         whole_days.checked_add(1)?
     }
     .checked_mul(SECONDS_PER_DAY)?;
-    Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(midnight).ok()?))
+    SystemTime::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(u64::try_from(midnight).ok()?))
 }
 
 /// The instant `date` names, or `None` when it is outside the range a [`SystemTime`] on

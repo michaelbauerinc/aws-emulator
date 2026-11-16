@@ -129,3 +129,10 @@ mod validation_refusal_identity;
 mod unreadable_request_values;
 #[path = "all/unsupported_instance_types.rs"]
 mod unsupported_instance_types;
+
+// This executable owns the allocator used by Windows Python invocations.
+#[cfg(windows)]
+#[global_allocator]
+static WINDOWS_ALLOCATOR:
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator<std::alloc::System> =
+    service_com_amazonaws_lambda_awsgirapiservice::WindowsLambdaAllocator::new(std::alloc::System);
